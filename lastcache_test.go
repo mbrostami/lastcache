@@ -22,7 +22,7 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 		beforeTime func() time.Time
 		afterTime  func() time.Time
 
-		callback func(key any) (any, error)
+		callback func(key any) (any, bool, error)
 	}
 	tests := []struct {
 		name    string
@@ -43,8 +43,8 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 				value:      "value",
 				beforeTime: func() time.Time { return fixedTime() },
 				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(key any) (any, error) {
-					return nil, errors.New("unavailable")
+				callback: func(key any) (any, bool, error) {
+					return nil, true, errors.New("unavailable")
 				},
 			},
 			want:    "value",
@@ -62,8 +62,8 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 				value:      "value",
 				beforeTime: func() time.Time { return fixedTime() },
 				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(key any) (any, error) {
-					return "value2", nil
+				callback: func(key any) (any, bool, error) {
+					return "value2", false, nil
 				},
 			},
 			want:    "value2",
@@ -81,8 +81,8 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 				value:      "value",
 				beforeTime: func() time.Time { return fixedTime() },
 				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(key any) (any, error) {
-					return "value2", nil
+				callback: func(key any) (any, bool, error) {
+					return "value2", false, nil
 				},
 			},
 			want:    "value",
@@ -101,8 +101,8 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 				value:      "value",
 				beforeTime: func() time.Time { return fixedTime() },
 				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(key any) (any, error) {
-					return "value2", nil
+				callback: func(key any) (any, bool, error) {
+					return "value2", false, nil
 				},
 			},
 			want:    "value",
@@ -124,7 +124,7 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
+			if !reflect.DeepEqual(got.Value, tt.want) {
 				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
 			}
 		})
@@ -138,7 +138,7 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 	type args struct {
 		key      any
 		value    any
-		callback func(key any) (any, error)
+		callback func(key any) (any, bool, error)
 	}
 	tests := []struct {
 		name    string
@@ -148,7 +148,7 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "callback with err",
+			name: "callback with err using last cache",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 10 * time.Millisecond,
@@ -157,12 +157,29 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 			args: args{
 				key:   "storeKey",
 				value: "value",
-				callback: func(key any) (any, error) {
-					return nil, errors.New("unavailable")
+				callback: func(key any) (any, bool, error) {
+					return nil, true, errors.New("unavailable")
 				},
 			},
 			want:    "value",
 			wantErr: false,
+		},
+		{
+			name: "callback with err not using last cache",
+			fields: fields{
+				config: Config{
+					GlobalTTL: 1 * time.Nanosecond,
+				},
+			},
+			args: args{
+				key:   "storeKey",
+				value: "value",
+				callback: func(key any) (any, bool, error) {
+					return nil, false, errors.New("unavailable")
+				},
+			},
+			want:    nil,
+			wantErr: true,
 		},
 		{
 			name: "callback with no err",
@@ -174,8 +191,8 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 			args: args{
 				key:   "storeKey",
 				value: "value",
-				callback: func(key any) (any, error) {
-					return "value", nil
+				callback: func(key any) (any, bool, error) {
+					return "value", false, nil
 				},
 			},
 			want:    "value",
@@ -187,14 +204,17 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 			c := &Cache{
 				config: tt.fields.config,
 			}
+			now = func() time.Time { return fixedTime() }
 			c.Set(tt.args.key, tt.args.value)
-
+			now = func() time.Time {
+				return fixedTime().Add(tt.fields.config.GlobalTTL + 1)
+			}
 			got, err := c.LoadOrStore(tt.args.key, tt.args.callback)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
+			if got != nil && !reflect.DeepEqual(got.Value, tt.want) {
 				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
 			}
 		})
@@ -209,13 +229,13 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 		storeKey  any
 		lookupKey any
 		value     any
-		callback  func(key any) (any, error)
+		callback  func(key any) (any, bool, error)
 	}
 	tests := []struct {
 		name    string
 		fields  fields
 		args    args
-		want    any
+		want    Entry
 		wantErr bool
 	}{
 		{
@@ -229,8 +249,8 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 				storeKey:  "storeKey",
 				lookupKey: "key2",
 				value:     "value",
-				callback: func(key any) (any, error) {
-					return nil, errors.New("unavailable")
+				callback: func(key any) (any, bool, error) {
+					return nil, false, errors.New("unavailable")
 				},
 			},
 			wantErr: true,
@@ -246,11 +266,29 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 				storeKey:  "storeKey",
 				lookupKey: "key2",
 				value:     "value",
-				callback: func(key any) (any, error) {
-					return "value for key2", nil
+				callback: func(key any) (any, bool, error) {
+					return "value for key2", false, nil
 				},
 			},
-			want:    "value for key2",
+			want:    Entry{Value: "value for key2"},
+			wantErr: false,
+		},
+		{
+			name: "callback with err use last cache",
+			fields: fields{
+				config: Config{
+					GlobalTTL: 10 * time.Millisecond,
+				},
+			},
+			args: args{
+				storeKey:  "key",
+				lookupKey: "key",
+				value:     "value",
+				callback: func(key any) (any, bool, error) {
+					return nil, true, errors.New("unavailable")
+				},
+			},
+			want:    Entry{Value: "value", Expired: true, Err: errors.New("unavailable")},
 			wantErr: false,
 		},
 	}
@@ -259,14 +297,20 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 			c := &Cache{
 				config: tt.fields.config,
 			}
+			now = func() time.Time { return fixedTime() }
 			c.Set(tt.args.storeKey, tt.args.value)
+
+			// expire the key
+			now = func() time.Time {
+				return fixedTime().Add(tt.fields.config.GlobalTTL + 1)
+			}
 
 			got, err := c.LoadOrStore(tt.args.lookupKey, tt.args.callback)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
+			if got != nil && !reflect.DeepEqual(*got, tt.want) {
 				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
 			}
 		})
@@ -279,7 +323,7 @@ func TestCache_LoadOrStore(t *testing.T) {
 	}
 	type args struct {
 		key      any
-		callback func(key any) (any, error)
+		callback func(key any) (any, bool, error)
 	}
 	tests := []struct {
 		name    string
@@ -297,8 +341,8 @@ func TestCache_LoadOrStore(t *testing.T) {
 			},
 			args: args{
 				key: "storeKey",
-				callback: func(key any) (any, error) {
-					return nil, errors.New("unavailable")
+				callback: func(key any) (any, bool, error) {
+					return nil, false, errors.New("unavailable")
 				},
 			},
 			want:    nil,
@@ -313,8 +357,8 @@ func TestCache_LoadOrStore(t *testing.T) {
 			},
 			args: args{
 				key: "storeKey",
-				callback: func(key any) (any, error) {
-					return "value", nil
+				callback: func(key any) (any, bool, error) {
+					return "value", false, nil
 				},
 			},
 			want:    "value",
@@ -331,7 +375,7 @@ func TestCache_LoadOrStore(t *testing.T) {
 				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
+			if got != nil && !reflect.DeepEqual(got.Value, tt.want) {
 				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
 			}
 		})
@@ -348,7 +392,7 @@ func TestCache_LoadOrStore_NrCalls(t *testing.T) {
 		value      any
 		beforeTime func() time.Time
 		afterTime  func() time.Time
-		callback   func(key any) (any, error)
+		callback   func(key any) (any, bool, error)
 	}
 	tests := []struct {
 		name        string
@@ -370,9 +414,9 @@ func TestCache_LoadOrStore_NrCalls(t *testing.T) {
 				value:      "value",
 				beforeTime: func() time.Time { return fixedTime() },
 				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(key any) (any, error) {
+				callback: func(key any) (any, bool, error) {
 					nrCalls++
-					return nil, errors.New("unavailable")
+					return nil, true, errors.New("unavailable")
 				},
 			},
 			want:        "value",
@@ -397,7 +441,7 @@ func TestCache_LoadOrStore_NrCalls(t *testing.T) {
 				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
+			if got != nil && !reflect.DeepEqual(got.Value, tt.want) {
 				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
 			}
 
@@ -623,8 +667,8 @@ func TestCache_LoadOrStore_Race(t *testing.T) {
 		for i := 0; i < 100; i++ {
 			go func() {
 				c.Set(key, value)
-				c.LoadOrStore(key, func(key any) (any, error) {
-					return value, nil
+				c.LoadOrStore(key, func(key any) (any, bool, error) {
+					return value, false, nil
 				})
 				c.TTL(key)
 				c.Delete(key)
@@ -639,10 +683,10 @@ func BenchmarkLoadOrStore(b *testing.B) {
 	c := New(Config{GlobalTTL: 1 * time.Millisecond})
 	c.Set("key", "value")
 	for i := 0; i < b.N; i++ {
-		g, _ := c.LoadOrStore("key", func(key any) (any, error) {
-			return "value", nil
+		g, _ := c.LoadOrStore("key", func(key any) (any, bool, error) {
+			return "value", false, nil
 		})
-		if g != "value" {
+		if g.Value != "value" {
 			b.Errorf("got %v, want %v", g, "value")
 		}
 	}

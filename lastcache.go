@@ -1,19 +1,30 @@
 package lastcache
 
 import (
-	"errors"
 	"sync"
 	"time"
 )
 
 const defaultTTL = 1 * time.Minute
 
-var ErrRecordDoesntExist = errors.New("record doesnt exist")
 var now = time.Now
+
+// callback given key, should return the value
+// true useLastCache can be used to retrieve the latest available value from cache
+// if it's not possible to get the value at the moment
+type callback func(key any) (value any, useLastCache bool, err error)
 
 type Config struct {
 	// can not be negative or 0,
 	GlobalTTL time.Duration
+}
+
+type Entry struct {
+	Value   any
+	Expired bool
+
+	// holds the underlying error if last available cache is used
+	Err error
 }
 
 type Cache struct {
@@ -54,54 +65,68 @@ func (c *Cache) TTL(key any) time.Duration {
 	return 0
 }
 
-// LoadOrStore loads an item from cache with respect to the ttl. There will be three cases:
+// LoadOrStore loads a key from cache with respect to the ttl.
 //
-//  1. If item doesn't exist, callback will be called to store the cache version.
-//     1.1 If callback returns error, the err will be passed to the higher level
+//		There will be three cases:
 //
-//  2. If item is expired, callback will be called to replace the value,
-//     2.1 if callback returns error, the last existing in memory cache will be used and ttl will be reset
-//
-//  3. If item is not expired, the value will be returned
-//
-// In theory ErrRecordDoesntExist shouldn't happen, unless there is inconsistency between ttl, and value storage
-func (c *Cache) LoadOrStore(key any, callback func(key any) (any, error)) (any, error) {
+//		1. If key exists and is not expired, the value will be returned as Entry
+//		2. If key doesn't exist, callback will be called to store the value.
+//		   2.1 If callback returns error, the error will be returned
+//		   2.2 If callback returns no error, the value will be stored and returned
+//		3. If key is expired, callback will be called to replace the value,
+//		   3.1 if callback returns no error, key will be updated with new value and returned
+//	       3.2 if callback returns error with true useLastCache,
+//				cached value will be added to the entry.Value,
+//	   			callback error will be added to the entry.Err,
+//				ttl will be extended,
+//			   	entry and nil will be returned
+//	       3.3 if callback returns error with false useLastCache,
+//				error will be returned
+func (c *Cache) LoadOrStore(key any, callback callback) (*Entry, error) {
 	var newValue any
 	var err error
+	var entry Entry
+
 	v, ok := c.timeStorage.Load(key)
 	if !ok {
 		// first time miss
-		newValue, err = callback(key)
+		newValue, _, err = callback(key)
 		if err != nil {
 			return nil, err
 		}
 
 		// store cache
 		c.Set(key, newValue)
-		return newValue, nil
+		entry.Value = newValue
+		return &entry, nil
 	}
 
-	var updateTTL bool
 	d, _ := v.(time.Time)
 	if now().After(d) { // expired
-		if newValue, err = callback(key); err == nil {
+		entry.Expired = true
+		var useLastCache bool
+		newValue, useLastCache, err = callback(key)
+		if err == nil {
 			// store cache and set new ttl
 			c.Set(key, newValue)
-			return newValue, nil
+			entry.Value = newValue
+			return &entry, nil
 		}
-		// if there is any error ignore expiration and load from cache
-		updateTTL = true
+
+		if !useLastCache {
+			return nil, err
+		}
+
+		entry.Expired = true
+		entry.Err = err
 	}
 
-	if v, ok = c.mapStorage.Load(key); ok {
-		if updateTTL {
-			c.updateTTL(key, c.config.GlobalTTL)
-		}
-		return v, nil
+	v, _ = c.mapStorage.Load(key)
+	if entry.Expired {
+		c.updateTTL(key, c.config.GlobalTTL)
 	}
-
-	// should never happen
-	return nil, ErrRecordDoesntExist
+	entry.Value = v
+	return &entry, nil
 }
 
 // updateTTL updates the ttl for the item.
