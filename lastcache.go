@@ -1,3 +1,12 @@
+// Package lastcache implements stale-while-revalidate and stale-if-error in-memory cache strategy.
+//
+//	stale-if-error
+//	In the event of an error when fetching fresh data, the cache serves stale (expired) data for a specified period (Config.ExtendTTL). This ensures a fallback mechanism to provide some data even when the retrieval process encounters errors.
+//	`LoadOrStore` function is based on this strategy.
+//
+//	stale-while-revalidate
+//	Stale (expired) data is served to caller while a background process runs to refresh the cache.
+//	`AsyncLoadOrStore` function is based on this strategy.
 package lastcache
 
 import (
@@ -16,6 +25,7 @@ var now = time.Now
 type syncCallback func(key any) (value any, useLastCache bool, err error)
 type asyncCallback func(key any) (value any, err error)
 
+// Config configuration to construct LastCache
 type Config struct {
 	// will be used to set expire time for all the keys
 	// if set to negative or 0 the defaultTTL will be used
@@ -36,14 +46,20 @@ type Config struct {
 	AsyncSemaphore int
 }
 
+// Entry is cached entry
 type Entry struct {
+	// Value retrieved from callback
 	Value any
+
+	// Stale either the entry is stale or not
 	Stale bool
 
-	// holds the underlying error if last available cache is used
+	// Holds the underlying error if stale cache is used
 	Err error
 }
 
+// Cache use New function to construct a new Cache
+// Must not be copied after first use
 type Cache struct {
 	config      Config
 	mapStorage  sync.Map
