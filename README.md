@@ -1,4 +1,5 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/mbrostami/lastcache)](https://goreportcard.com/report/github.com/mbrostami/lastcache)
+![Coverage](https://img.shields.io/badge/Coverage-96.7%25-brightgreen)
 # LastCache
 LastCache is a go module that implements stale-while-revalidate and stale-if-error in-memory cache strategy.   
 
