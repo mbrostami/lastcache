@@ -1,10 +1,9 @@
 # LastCache
-LastCache is a go module that implements a resilient in-memory cache.  
+LastCache is a go module that implements a resilient in-memory cache. It prevents calling service to be failed if the caller is irresponsible.  
 
-e.g. In microservice architecture, when there is a need for synchronous call,
-last cache will be helpful to have resiliency.  
+e.g. In microservice architecture, when there is a need for synchronous call. Last cache will be helpful to have resiliency.  
 
-#### 3 cases example
+#### example
 ```go
 package main
 
@@ -30,13 +29,13 @@ func main() {
 	fmt.Printf("callback healthy, %+v, err: %v\n", val, err)
 	
 	
-	
+	// wait for cache to be expired
 	time.Sleep(2*time.Nanosecond)
 
 
 	////////////////////////////////////
 	// failed callback, using last cache
-	// cache is expired but failure to get fresh data
+	// the cache is expired but fails to get fresh data
 	val, err = lc.LoadOrStore("key", func(key any) (any, bool, error) {
 		// return err and use last available cache
 		return nil, true, errors.New("service unavailable")
@@ -45,7 +44,7 @@ func main() {
 
 	////////////////////////////////////////
 	// failed callback, not using last cache
-	// cache is expired but failure to get fresh data, not using cache
+	// the cache is expired but failure to get fresh data, not using cache
 	val, err = lc.LoadOrStore("key", func(key any) (any, bool, error) {
 		// return err and not use last cache
 		return nil, false, errors.New("service unavailable")
