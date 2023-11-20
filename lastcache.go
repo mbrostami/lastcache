@@ -20,29 +20,31 @@ const defaultSemaphore int = 1
 var now = time.Now
 
 // SyncCallback given key, should return the value
-// true useLastCache can be used to retrieve the latest available value from cache
-// if it's not possible to get the value at the moment
-type SyncCallback func(key any) (value any, useLastCache bool, err error)
+// true useStale can be used to retrieve the stale cache
+type SyncCallback func(key any) (value any, useStale bool, err error)
+
+// AsyncCallback given a key, should return the value
+// This will be called in a goroutine, considering the AsyncSemaphore
 type AsyncCallback func(key any) (value any, err error)
 
 // Config configuration to construct LastCache
 type Config struct {
-	// will be used to set expire time for all the keys
-	// if set to negative or 0 the defaultTTL will be used
+	// Will be used to set expire time for all the keys
+	// If set to negative or 0 the defaultTTL will be used
 	GlobalTTL time.Duration
 
-	// will be used to extend the ttl if cache is stale and callback is failed
-	// if set to 0 ttl will not be extended and evey call to LoadOrStore for stale cache will execute the callback
-	// until the callback can return new value with no error
-	// in most cases this should be set to the same value as GlobalTTL,
-	// unless the GlobalTTL is too high, or the callback is expensive to be called
+	// Will be used to extend the ttl if cache is stale and callback is failed
+	// If set to 0 ttl will not be extended and evey call to LoadOrStore for stale cache will execute the callback
+	// Until the callback can return new value with no error
+	// In most cases this should be set to the same value as GlobalTTL,
+	// Unless the GlobalTTL is too high, or the callback is expensive to be called
 	ExtendTTL time.Duration
 
-	// number of background callbacks allowed in AsyncLoadOrStore
-	// if set to 0 the default value defaultSemaphore will be used
-	// if you want to use AsyncLoadOrStore this will limit the number of callback calls while cache is expired
-	// if callback is too expensive to run, it's better to set to low value (e.g. 1)
-	// if you are using different callback processes for different keys, you might want to optimize this value
+	// Number of background callbacks allowed in AsyncLoadOrStore
+	// If set to 0 the default value defaultSemaphore will be used
+	// If you want to use AsyncLoadOrStore this will limit the number of callback calls while cache is expired
+	// If callback is too expensive to run, it's better to set to low value (e.g. 1)
+	// If you are using different callback processes for different keys, you might want to optimize this value or use another instance of LastCache
 	AsyncSemaphore int
 }
 
@@ -118,12 +120,12 @@ func (c *Cache) TTL(key any) time.Duration {
 //		   2.2 If SyncCallback returns no error, the value will be stored and returned
 //		3. If key is expired, SyncCallback will be called to replace the value,
 //		   3.1 if SyncCallback returns no error, key will be updated with new value and returned
-//	       3.2 if SyncCallback returns error with true useLastCache,
+//	       3.2 if SyncCallback returns error with true useStale,
 //				cached value will be added to the entry.Value,
 //	   			SyncCallback error will be added to the entry.Err,
 //				ttl will be extended,
 //			   	entry and nil will be returned
-//	       3.3 if SyncCallback returns error with false useLastCache,
+//	       3.3 if SyncCallback returns error with false useStale,
 //				error will be returned
 func (c *Cache) LoadOrStore(key any, callback SyncCallback) (*Entry, error) {
 	var newValue any
@@ -146,8 +148,8 @@ func (c *Cache) LoadOrStore(key any, callback SyncCallback) (*Entry, error) {
 
 	d, _ := v.(time.Time)
 	if now().After(d) { // expired
-		var useLastCache bool
-		newValue, useLastCache, err = callback(key)
+		var useStale bool
+		newValue, useStale, err = callback(key)
 		if err == nil {
 			// store cache and set new ttl
 			c.Set(key, newValue)
@@ -155,7 +157,7 @@ func (c *Cache) LoadOrStore(key any, callback SyncCallback) (*Entry, error) {
 			return &entry, nil
 		}
 
-		if !useLastCache {
+		if !useStale {
 			return nil, err
 		}
 
