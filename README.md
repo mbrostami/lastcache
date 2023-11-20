@@ -25,6 +25,7 @@ import (
 
 func main() {
 
+
 	var callbackErr error
 	lc := lastcache.New(lastcache.Config{
 		GlobalTTL:      1 * time.Nanosecond, // 1 * time.Minute,
@@ -34,19 +35,19 @@ func main() {
 	/////////////////////////////////////////////////////
 	////////////////// stale-if-error ///////////////////
 	// successful callback
-	val, err := lc.LoadOrStore("key", func(key any) (value any, useStale bool, err error) {
+	val, err := lc.LoadOrStore("key", func(ctx context.Context, key any) (value any, useStale bool, err error) {
 		return "value", false, nil
 	})
 	fmt.Printf("sync, \tValue: %s, \tStale: %v, \tCallbackErr: %v, \terr: %v\n", val.Value, val.Stale, val.Err, err)
 
 	// failed callback - use stale
-	val, err = lc.LoadOrStore("key", func(key any) (value any, useStale bool, err error) {
+	val, err = lc.LoadOrStore("key", func(ctx context.Context, key any) (value any, useStale bool, err error) {
 		return nil, true, errors.New("connection lost")
 	})
 	fmt.Printf("sync, \tValue: %s, \tStale: %v, \tCallbackErr: %v, \terr: %v\n", val.Value, val.Stale, val.Err, err)
 
 	// failed callback - do not use stale
-	val, err = lc.LoadOrStore("key", func(key any) (value any, useStale bool, err error) {
+	val, err = lc.LoadOrStore("key", func(ctx context.Context, key any) (value any, useStale bool, err error) {
 		return nil, false, errors.New("resource not found")
 	})
 	fmt.Printf("sync, \tValue: %+v, \terr: %v\n", val, err)

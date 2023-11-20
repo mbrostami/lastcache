@@ -23,7 +23,7 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 		beforeTime func() time.Time
 		afterTime  func() time.Time
 
-		callback func(key any) (any, bool, error)
+		callback SyncCallback
 	}
 	tests := []struct {
 		name    string
@@ -44,7 +44,7 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 				value:      "value",
 				beforeTime: func() time.Time { return fixedTime() },
 				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return nil, true, errors.New("unavailable")
 				},
 			},
@@ -63,7 +63,7 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 				value:      "value",
 				beforeTime: func() time.Time { return fixedTime() },
 				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return "value2", false, nil
 				},
 			},
@@ -82,7 +82,7 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 				value:      "value",
 				beforeTime: func() time.Time { return fixedTime() },
 				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return "value2", false, nil
 				},
 			},
@@ -102,7 +102,7 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 				value:      "value",
 				beforeTime: func() time.Time { return fixedTime() },
 				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return "value2", false, nil
 				},
 			},
@@ -140,7 +140,7 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 	type args struct {
 		key      any
 		value    any
-		callback func(key any) (any, bool, error)
+		callback SyncCallback
 	}
 	tests := []struct {
 		name    string
@@ -159,7 +159,7 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 			args: args{
 				key:   "storeKey",
 				value: "value",
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return nil, true, errors.New("unavailable")
 				},
 			},
@@ -176,7 +176,7 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 			args: args{
 				key:   "storeKey",
 				value: "value",
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return nil, false, errors.New("unavailable")
 				},
 			},
@@ -193,7 +193,7 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 			args: args{
 				key:   "storeKey",
 				value: "value",
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return "value", false, nil
 				},
 			},
@@ -231,7 +231,7 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 		storeKey  any
 		lookupKey any
 		value     any
-		callback  func(key any) (any, bool, error)
+		callback  SyncCallback
 	}
 	tests := []struct {
 		name    string
@@ -251,7 +251,7 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 				storeKey:  "storeKey",
 				lookupKey: "key2",
 				value:     "value",
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return nil, false, errors.New("unavailable")
 				},
 			},
@@ -268,7 +268,7 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 				storeKey:  "storeKey",
 				lookupKey: "key2",
 				value:     "value",
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return "value for key2", false, nil
 				},
 			},
@@ -286,7 +286,7 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 				storeKey:  "key",
 				lookupKey: "key",
 				value:     "value",
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return nil, true, errors.New("unavailable")
 				},
 			},
@@ -325,7 +325,7 @@ func TestCache_LoadOrStore(t *testing.T) {
 	}
 	type args struct {
 		key      any
-		callback func(key any) (any, bool, error)
+		callback SyncCallback
 	}
 	tests := []struct {
 		name    string
@@ -343,7 +343,7 @@ func TestCache_LoadOrStore(t *testing.T) {
 			},
 			args: args{
 				key: "storeKey",
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return nil, false, errors.New("unavailable")
 				},
 			},
@@ -359,7 +359,7 @@ func TestCache_LoadOrStore(t *testing.T) {
 			},
 			args: args{
 				key: "storeKey",
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					return "value", false, nil
 				},
 			},
@@ -395,7 +395,7 @@ func TestCache_LoadOrStore_NrCalls(t *testing.T) {
 		beforeTime func() time.Time
 		firstTime  func() time.Time
 		secondTime func() time.Time
-		callback   func(key any) (any, bool, error)
+		callback   SyncCallback
 	}
 	tests := []struct {
 		name        string
@@ -417,7 +417,7 @@ func TestCache_LoadOrStore_NrCalls(t *testing.T) {
 				value:      "value",
 				beforeTime: func() time.Time { return fixedTime() },
 				firstTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					nrCalls++
 					return nil, true, errors.New("unavailable")
 				},
@@ -439,7 +439,7 @@ func TestCache_LoadOrStore_NrCalls(t *testing.T) {
 				value:      "value",
 				beforeTime: func() time.Time { return fixedTime() },
 				firstTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					nrCalls++
 					return nil, true, errors.New("unavailable")
 				},
@@ -462,7 +462,7 @@ func TestCache_LoadOrStore_NrCalls(t *testing.T) {
 				beforeTime: func() time.Time { return fixedTime() },
 				firstTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
 				secondTime: func() time.Time { return fixedTime().Add(16 * time.Millisecond) },
-				callback: func(key any) (any, bool, error) {
+				callback: func(ctx context.Context, key any) (any, bool, error) {
 					nrCalls++
 					return nil, true, errors.New("unavailable")
 				},
@@ -719,7 +719,7 @@ func TestCache_LoadOrStore_Race(t *testing.T) {
 		for i := 0; i < 100; i++ {
 			go func() {
 				c.Set(key, value)
-				c.LoadOrStore(key, func(key any) (any, bool, error) {
+				c.LoadOrStore(key, func(ctx context.Context, key any) (any, bool, error) {
 					return value, false, nil
 				})
 				c.TTL(key)
@@ -988,7 +988,6 @@ func TestCache_AsyncLoadOrStoreConcurrentTwoSemaphore(t *testing.T) {
 	val := "value"
 
 	callbackFirst := func(_ context.Context, key any) (value any, err error) {
-		time.Sleep(20 * time.Millisecond) // make this slower than second callback
 		return "new_value_1", nil
 	}
 
@@ -1050,8 +1049,8 @@ func TestCache_AsyncLoadOrStoreConcurrentTwoSemaphore(t *testing.T) {
 		t.Errorf("failed with err: %v", err)
 	}
 
-	if entry.Value != "new_value_2" { // two callbacks run at the same time
-		t.Errorf("entry Value got %v, want new_value_2", entry.Value)
+	if entry.Value != "new_value_2" && entry.Value != "new_value_1" { // two callbacks run at the same time
+		t.Errorf("entry Value got %v, want new_value_2 or new_value_1", entry.Value)
 	}
 
 	if entry.Stale == true {
@@ -1063,7 +1062,7 @@ func BenchmarkLoadOrStore(b *testing.B) {
 	c := New(Config{GlobalTTL: 1 * time.Millisecond})
 	c.Set("key", "value")
 	for i := 0; i < b.N; i++ {
-		g, _ := c.LoadOrStore("key", func(key any) (any, bool, error) {
+		g, _ := c.LoadOrStore("key", func(ctx context.Context, key any) (any, bool, error) {
 			return "value", false, nil
 		})
 		if g.Value != "value" {

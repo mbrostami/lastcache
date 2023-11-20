@@ -23,7 +23,7 @@ var now = time.Now
 
 // SyncCallback given key, should return the value
 // true useStale can be used to retrieve the stale cache
-type SyncCallback func(key any) (value any, useStale bool, err error)
+type SyncCallback func(ctx context.Context, key any) (value any, useStale bool, err error)
 
 // AsyncCallback given a key, should return the value
 // This will be called in a goroutine, considering the AsyncSemaphore
@@ -141,6 +141,68 @@ func (c *Cache) TTL(key any) time.Duration {
 //	       3.3 if SyncCallback returns error with false useStale,
 //				error will be returned
 func (c *Cache) LoadOrStore(key any, callback SyncCallback) (*Entry, error) {
+	return c.loadOrStore(c.context(), key, callback)
+}
+
+// LoadOrStoreWithCtx check LoadOrStore
+func (c *Cache) LoadOrStoreWithCtx(ctx context.Context, key any, callback SyncCallback) (*Entry, error) {
+	return c.loadOrStore(ctx, key, callback)
+}
+
+// AsyncLoadOrStore loads the key from cache with respect to the ttl and runs the callback in background
+//
+//		There will be three cases:
+//
+//		1. If key exists and is not expired, the value will be returned as Entry
+//		2. If key doesn't exist, callback will be called to store the value.
+//		   2.1 If SyncCallback returns error, the error will be returned
+//		   2.2 If SyncCallback returns no error, the value will be stored and returned
+//		3. If key is expired, callback will be called in background to replace the value,
+//		   and existing cache will be returned immediately
+//		   a buffered error channel size 1 will be returned if cache is stale,
+//	       nil or error will be sent to the error channel
+func (c *Cache) AsyncLoadOrStore(key any, callback AsyncCallback) (*Entry, chan error, error) {
+	return c.asyncLoadOrStore(c.context(), key, callback)
+}
+
+// AsyncLoadOrStoreWithCtx check AsyncLoadOrStore
+func (c *Cache) AsyncLoadOrStoreWithCtx(ctx context.Context, key any, callback AsyncCallback) (*Entry, chan error, error) {
+	return c.asyncLoadOrStore(ctx, key, callback)
+}
+
+func (c *Cache) asyncLoadOrStore(ctx context.Context, key any, callback AsyncCallback) (*Entry, chan error, error) {
+	var err error
+	var entry Entry
+
+	v, ok := c.timeStorage.Load(key)
+	if !ok {
+		var newValue any
+		// first time miss
+		newValue, err = callback(ctx, key)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// store cache
+		c.Set(key, newValue)
+		entry.Value = newValue
+		return &entry, nil, nil
+	}
+
+	d, _ := v.(time.Time)
+	var ch chan error
+	if now().After(d) { // expired
+		ch = make(chan error, 1)
+		go c.updateCache(ctx, key, callback, ch)
+		entry.Stale = true
+	}
+
+	v, _ = c.mapStorage.Load(key)
+	entry.Value = v
+	return &entry, ch, nil
+}
+
+func (c *Cache) loadOrStore(ctx context.Context, key any, callback SyncCallback) (*Entry, error) {
 	var newValue any
 	var err error
 	var entry Entry
@@ -148,7 +210,7 @@ func (c *Cache) LoadOrStore(key any, callback SyncCallback) (*Entry, error) {
 	v, ok := c.timeStorage.Load(key)
 	if !ok {
 		// first time miss
-		newValue, _, err = callback(key)
+		newValue, _, err = callback(ctx, key)
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +224,7 @@ func (c *Cache) LoadOrStore(key any, callback SyncCallback) (*Entry, error) {
 	d, _ := v.(time.Time)
 	if now().After(d) { // expired
 		var useStale bool
-		newValue, useStale, err = callback(key)
+		newValue, useStale, err = callback(ctx, key)
 		if err == nil {
 			// store cache and set new ttl
 			c.Set(key, newValue)
@@ -188,50 +250,6 @@ func (c *Cache) LoadOrStore(key any, callback SyncCallback) (*Entry, error) {
 	return &entry, nil
 }
 
-// AsyncLoadOrStore loads the key from cache with respect to the ttl and runs the callback in background
-//
-//		There will be three cases:
-//
-//		1. If key exists and is not expired, the value will be returned as Entry
-//		2. If key doesn't exist, callback will be called to store the value.
-//		   2.1 If SyncCallback returns error, the error will be returned
-//		   2.2 If SyncCallback returns no error, the value will be stored and returned
-//		3. If key is expired, callback will be called in background to replace the value,
-//		   and existing cache will be returned immediately
-//		   a buffered error channel size 1 will be returned if cache is stale,
-//	       nil or error will be sent to the error channel
-func (c *Cache) AsyncLoadOrStore(key any, callback AsyncCallback) (*Entry, chan error, error) {
-	var err error
-	var entry Entry
-
-	v, ok := c.timeStorage.Load(key)
-	if !ok {
-		var newValue any
-		// first time miss
-		newValue, err = callback(c.ctx, key)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		// store cache
-		c.Set(key, newValue)
-		entry.Value = newValue
-		return &entry, nil, nil
-	}
-
-	d, _ := v.(time.Time)
-	var ch chan error
-	if now().After(d) { // expired
-		ch = make(chan error, 1)
-		go c.updateCache(key, callback, ch)
-		entry.Stale = true
-	}
-
-	v, _ = c.mapStorage.Load(key)
-	entry.Value = v
-	return &entry, ch, nil
-}
-
 func (c *Cache) checkIfExpired(key any) bool {
 	v, ok := c.timeStorage.Load(key)
 	if !ok {
@@ -242,7 +260,7 @@ func (c *Cache) checkIfExpired(key any) bool {
 	return now().After(d)
 }
 
-func (c *Cache) updateCache(key any, callback AsyncCallback, errChan chan error) {
+func (c *Cache) updateCache(ctx context.Context, key any, callback AsyncCallback, errChan chan error) {
 	c.semaphore <- true
 	var err error
 	defer func() {
@@ -260,11 +278,15 @@ func (c *Cache) updateCache(key any, callback AsyncCallback, errChan chan error)
 		c.updateTTL(key, c.config.ExtendTTL)
 	}
 
-	newValue, err := callback(c.ctx, key)
+	newValue, err := callback(ctx, key)
 	if err == nil {
 		// store cache and set new ttl
 		c.Set(key, newValue)
 	}
+}
+
+func (c *Cache) context() context.Context {
+	return c.ctx
 }
 
 func (c *Cache) updateTTL(key any, ttl time.Duration) {
