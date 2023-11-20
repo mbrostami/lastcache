@@ -1,29 +1,16 @@
-# LastCache
-LastCache is a go module that implements stale-while-revalidate and stale-if-error in-memory cache strategy.   
-
-### stale-if-error
-In the event of an error when fetching fresh data, the cache serves stale (expired) data for a specified period (Config.ExtendTTL). This ensures a fallback mechanism to provide some data even when the retrieval process encounters errors.  
-`LoadOrStore` function is based on this strategy.  
-
-### stale-while-revalidate
-Stale (expired) data is served to caller while a background process runs to refresh the cache.      
-`AsyncLoadOrStore` function is based on this strategy.
-
-
-### Examples
-```go
-package main
+package lastcache_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"testing"
 	"time"
-	"context"
 
 	"github.com/mbrostami/lastcache"
 )
 
-func main() {
+func Test(t *testing.T) {
 
 	var callbackErr error
 	lc := lastcache.New(lastcache.Config{
@@ -72,14 +59,3 @@ func main() {
 	}
 	fmt.Printf("async, \tValue: %s, \tStale: %v, \tCallbackErr: %v, \terr: %v\n", val.Value, val.Stale, callbackErr, err)
 }
-
-```
-
-Output: 
-```
-sync, 	Value: value, 	Stale: false, 	CallbackErr: <nil>, 	err: <nil>
-sync, 	Value: value, 	Stale: true, 	CallbackErr: connection lost, 	err: <nil>
-sync, 	Value: <nil>, 	err: resource not found
-async, 	Value: value, 	Stale: false, 	CallbackErr: <nil>, 	err: <nil>
-async, 	Value: value, 	Stale: true, 	CallbackErr: some query error, 	err: <nil>
-```

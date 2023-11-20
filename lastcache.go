@@ -10,11 +10,13 @@
 package lastcache
 
 import (
+	"context"
 	"sync"
 	"time"
 )
 
 const defaultTTL = 1 * time.Minute
+
 const defaultSemaphore int = 1
 
 var now = time.Now
@@ -25,7 +27,7 @@ type SyncCallback func(key any) (value any, useStale bool, err error)
 
 // AsyncCallback given a key, should return the value
 // This will be called in a goroutine, considering the AsyncSemaphore
-type AsyncCallback func(key any) (value any, err error)
+type AsyncCallback func(ctx context.Context, key any) (value any, err error)
 
 // Config configuration to construct LastCache
 type Config struct {
@@ -46,17 +48,22 @@ type Config struct {
 	// If callback is too expensive to run, it's better to set to low value (e.g. 1)
 	// If you are using different callback processes for different keys, you might want to optimize this value or use another instance of LastCache
 	AsyncSemaphore int
+
+	// Context to be used in lifetime of the Cache instance
+	// Default is context.TODO()
+	Context context.Context
 }
 
-// Entry is cached entry
+// Entry cache entry
 type Entry struct {
 	// Value retrieved from callback
 	Value any
 
-	// Stale either the entry is stale or not
+	// Either the cache entry is stale or not
 	Stale bool
 
-	// Holds the underlying error if stale cache is used
+	// Holds the underlying error if stale cache is used when using LoadOrStore
+	// In case of using AsyncLoadOrStore this always will be nil and the underlying error will be returned in channel
 	Err error
 }
 
@@ -64,6 +71,7 @@ type Entry struct {
 // Must not be copied after first use
 type Cache struct {
 	config      Config
+	ctx         context.Context
 	mapStorage  sync.Map
 	timeStorage sync.Map
 	semaphore   chan bool
@@ -77,6 +85,11 @@ func New(config Config) *Cache {
 
 	c := Cache{
 		config: config,
+	}
+
+	c.ctx = context.TODO()
+	if config.Context != nil {
+		c.ctx = config.Context
 	}
 
 	semaphore := defaultSemaphore
@@ -195,7 +208,7 @@ func (c *Cache) AsyncLoadOrStore(key any, callback AsyncCallback) (*Entry, chan 
 	if !ok {
 		var newValue any
 		// first time miss
-		newValue, err = callback(key)
+		newValue, err = callback(c.ctx, key)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -247,7 +260,7 @@ func (c *Cache) updateCache(key any, callback AsyncCallback, errChan chan error)
 		c.updateTTL(key, c.config.ExtendTTL)
 	}
 
-	newValue, err := callback(key)
+	newValue, err := callback(c.ctx, key)
 	if err == nil {
 		// store cache and set new ttl
 		c.Set(key, newValue)

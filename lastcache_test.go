@@ -1,6 +1,7 @@
 package lastcache
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"sync"
@@ -734,7 +735,7 @@ func TestCache_AsyncLoadOrStoreNonExistingKey(t *testing.T) {
 	key := "key"
 	val := "value"
 
-	callback := func(key any) (value any, err error) {
+	callback := func(_ context.Context, key any) (value any, err error) {
 		return val, nil
 	}
 
@@ -761,7 +762,7 @@ func TestCache_AsyncLoadOrStoreNonExistingKey(t *testing.T) {
 func TestCache_AsyncLoadOrStoreNonExistingKeyWithError(t *testing.T) {
 	key := "key"
 
-	callback := func(key any) (value any, err error) {
+	callback := func(_ context.Context, key any) (value any, err error) {
 		return nil, errors.New("not found")
 	}
 
@@ -785,7 +786,7 @@ func TestCache_AsyncLoadOrStore(t *testing.T) {
 	key := "key"
 	val := "value"
 
-	callback := func(key any) (value any, err error) {
+	callback := func(_ context.Context, key any) (value any, err error) {
 		time.Sleep(5 * time.Millisecond)
 		return "new_value", nil
 	}
@@ -837,15 +838,84 @@ func TestCache_AsyncLoadOrStore(t *testing.T) {
 	}
 }
 
+func TestCache_AsyncLoadOrStoreWithContext(t *testing.T) {
+	key := "key"
+	val := "value"
+
+	callback := func(ctx context.Context, key any) (value any, err error) {
+		select {
+		case <-ctx.Done():
+			return nil, errors.New("context canceled")
+		default:
+			time.Sleep(5 * time.Millisecond)
+			return "new_value", nil
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cache := New(Config{
+		GlobalTTL:      10 * time.Millisecond,
+		ExtendTTL:      10 * time.Millisecond,
+		AsyncSemaphore: 1,
+		Context:        ctx,
+	})
+
+	//////////// time 0
+	now = func() time.Time { return fixedTime() }
+
+	cache.Set(key, val)
+
+	//////////// time 1
+	// GlobalTTL + 1 makes cache expired
+	now = func() time.Time { return fixedTime().Add(11 * time.Millisecond) }
+
+	cancel() // cancel the context, so callback will return error
+
+	entry, ch, err := cache.AsyncLoadOrStore(key, callback)
+	if err != nil {
+		t.Errorf("failed with err: %v", err)
+	}
+
+	if entry.Value != val {
+		t.Errorf("entry Value got %v, want %v", entry.Value, val)
+	}
+
+	if entry.Stale == false {
+		t.Errorf("entry Stale expected to be true, false returned")
+	}
+
+	//////////// time 2
+	if ch != nil {
+		if err := <-ch; err == nil {
+			t.Errorf("err is nil")
+		}
+	}
+	// 11 + 5(callback time) + 1
+	now = func() time.Time { return fixedTime().Add(17 * time.Millisecond) }
+
+	entry, _, err = cache.AsyncLoadOrStore(key, callback)
+	if err != nil {
+		t.Errorf("failed with err: %v", err)
+	}
+
+	if entry.Value != val {
+		t.Errorf("entry Value got %v, want %v", entry.Value, val)
+	}
+
+	if entry.Stale == true {
+		t.Errorf("entry Stale expected to be false, true returned")
+	}
+}
+
 func TestCache_AsyncLoadOrStoreConcurrentOneSemaphore(t *testing.T) {
 	key := "key"
 	val := "value"
 
-	callbackFirst := func(key any) (value any, err error) {
+	callbackFirst := func(_ context.Context, key any) (value any, err error) {
 		return "new_value_1", nil
 	}
 
-	callbackSecond := func(key any) (value any, err error) {
+	callbackSecond := func(_ context.Context, key any) (value any, err error) {
 		return "new_value_2", nil
 	}
 
@@ -917,12 +987,12 @@ func TestCache_AsyncLoadOrStoreConcurrentTwoSemaphore(t *testing.T) {
 	key := "key"
 	val := "value"
 
-	callbackFirst := func(key any) (value any, err error) {
+	callbackFirst := func(_ context.Context, key any) (value any, err error) {
 		time.Sleep(20 * time.Millisecond) // make this slower than second callback
 		return "new_value_1", nil
 	}
 
-	callbackSecond := func(key any) (value any, err error) {
+	callbackSecond := func(_ context.Context, key any) (value any, err error) {
 		return "new_value_2", nil
 	}
 
@@ -1006,7 +1076,7 @@ func BenchmarkAsyncLoadOrStore(b *testing.B) {
 	c := New(Config{GlobalTTL: 1 * time.Millisecond})
 	c.Set("key", "value")
 	for i := 0; i < b.N; i++ {
-		g, _, _ := c.AsyncLoadOrStore("key", func(key any) (any, error) {
+		g, _, _ := c.AsyncLoadOrStore("key", func(_ context.Context, key any) (any, error) {
 			return "value", nil
 		})
 		if g.Value != "value" {
