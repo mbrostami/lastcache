@@ -19,11 +19,11 @@ const defaultSemaphore int = 1
 
 var now = time.Now
 
-// syncCallback given key, should return the value
+// SyncCallback given key, should return the value
 // true useLastCache can be used to retrieve the latest available value from cache
 // if it's not possible to get the value at the moment
-type syncCallback func(key any) (value any, useLastCache bool, err error)
-type asyncCallback func(key any) (value any, err error)
+type SyncCallback func(key any) (value any, useLastCache bool, err error)
+type AsyncCallback func(key any) (value any, err error)
 
 // Config configuration to construct LastCache
 type Config struct {
@@ -113,19 +113,19 @@ func (c *Cache) TTL(key any) time.Duration {
 //		There will be three cases:
 //
 //		1. If key exists and is not expired, the value will be returned as Entry
-//		2. If key doesn't exist, syncCallback will be called to store the value.
-//		   2.1 If syncCallback returns error, the error will be returned
-//		   2.2 If syncCallback returns no error, the value will be stored and returned
-//		3. If key is expired, syncCallback will be called to replace the value,
-//		   3.1 if syncCallback returns no error, key will be updated with new value and returned
-//	       3.2 if syncCallback returns error with true useLastCache,
+//		2. If key doesn't exist, SyncCallback will be called to store the value.
+//		   2.1 If SyncCallback returns error, the error will be returned
+//		   2.2 If SyncCallback returns no error, the value will be stored and returned
+//		3. If key is expired, SyncCallback will be called to replace the value,
+//		   3.1 if SyncCallback returns no error, key will be updated with new value and returned
+//	       3.2 if SyncCallback returns error with true useLastCache,
 //				cached value will be added to the entry.Value,
-//	   			syncCallback error will be added to the entry.Err,
+//	   			SyncCallback error will be added to the entry.Err,
 //				ttl will be extended,
 //			   	entry and nil will be returned
-//	       3.3 if syncCallback returns error with false useLastCache,
+//	       3.3 if SyncCallback returns error with false useLastCache,
 //				error will be returned
-func (c *Cache) LoadOrStore(key any, callback syncCallback) (*Entry, error) {
+func (c *Cache) LoadOrStore(key any, callback SyncCallback) (*Entry, error) {
 	var newValue any
 	var err error
 	var entry Entry
@@ -179,13 +179,13 @@ func (c *Cache) LoadOrStore(key any, callback syncCallback) (*Entry, error) {
 //
 //		1. If key exists and is not expired, the value will be returned as Entry
 //		2. If key doesn't exist, callback will be called to store the value.
-//		   2.1 If syncCallback returns error, the error will be returned
-//		   2.2 If syncCallback returns no error, the value will be stored and returned
+//		   2.1 If SyncCallback returns error, the error will be returned
+//		   2.2 If SyncCallback returns no error, the value will be stored and returned
 //		3. If key is expired, callback will be called in background to replace the value,
 //		   and existing cache will be returned immediately
 //		   a buffered error channel size 1 will be returned if cache is stale,
 //	       nil or error will be sent to the error channel
-func (c *Cache) AsyncLoadOrStore(key any, callback asyncCallback) (*Entry, chan error, error) {
+func (c *Cache) AsyncLoadOrStore(key any, callback AsyncCallback) (*Entry, chan error, error) {
 	var err error
 	var entry Entry
 
@@ -227,7 +227,7 @@ func (c *Cache) checkIfExpired(key any) bool {
 	return now().After(d)
 }
 
-func (c *Cache) updateCache(key any, callback asyncCallback, errChan chan error) {
+func (c *Cache) updateCache(key any, callback AsyncCallback, errChan chan error) {
 	c.semaphore <- true
 	var err error
 	defer func() {

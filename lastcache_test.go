@@ -32,7 +32,7 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "syncCallback with error valid cache",
+			name: "SyncCallback with error valid cache",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 1 * time.Millisecond,
@@ -51,7 +51,7 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "expired cache, syncCallback with new value",
+			name: "expired cache, SyncCallback with new value",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 1 * time.Millisecond,
@@ -70,7 +70,7 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "non expired cache, syncCallback with new value",
+			name: "non expired cache, SyncCallback with new value",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 1 * time.Second,
@@ -90,7 +90,7 @@ func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 		},
 
 		{
-			name: "non expired cache, syncCallback with new value",
+			name: "non expired cache, SyncCallback with new value",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 1 * time.Second,
@@ -149,7 +149,7 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "syncCallback with err using last cache",
+			name: "SyncCallback with err using last cache",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 10 * time.Millisecond,
@@ -166,7 +166,7 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "syncCallback with err not using last cache",
+			name: "SyncCallback with err not using last cache",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 1 * time.Nanosecond,
@@ -183,7 +183,7 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "syncCallback with no err",
+			name: "SyncCallback with no err",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 10 * time.Millisecond,
@@ -240,7 +240,7 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "syncCallback with err",
+			name: "SyncCallback with err",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 10 * time.Millisecond,
@@ -257,7 +257,7 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "syncCallback with err",
+			name: "SyncCallback with err",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 10 * time.Millisecond,
@@ -275,7 +275,7 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "syncCallback with err use last cache",
+			name: "SyncCallback with err use last cache",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 10 * time.Millisecond,
@@ -334,7 +334,7 @@ func TestCache_LoadOrStore(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "syncCallback with error non existing cache",
+			name: "SyncCallback with error non existing cache",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 1 * time.Millisecond,
@@ -350,7 +350,7 @@ func TestCache_LoadOrStore(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "syncCallback no error",
+			name: "SyncCallback no error",
 			fields: fields{
 				config: Config{
 					GlobalTTL: 1 * time.Millisecond,
@@ -482,7 +482,7 @@ func TestCache_LoadOrStore_NrCalls(t *testing.T) {
 			now = tt.args.firstTime
 
 			nrCalls = 0
-			// read from syncCallback
+			// read from SyncCallback
 			got, err := c.LoadOrStore(tt.args.key, tt.args.callback)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
@@ -500,7 +500,7 @@ func TestCache_LoadOrStore_NrCalls(t *testing.T) {
 			c.LoadOrStore(tt.args.key, tt.args.callback)
 
 			if nrCalls != tt.wantNrCalls {
-				t.Errorf("Number of syncCallback calls got = %v, want %v", nrCalls, tt.wantNrCalls)
+				t.Errorf("Number of SyncCallback calls got = %v, want %v", nrCalls, tt.wantNrCalls)
 			}
 		})
 	}
