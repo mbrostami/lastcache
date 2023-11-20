@@ -1,9 +1,16 @@
 # LastCache
-LastCache is a go module that implements a resilient in-memory cache. It prevents calling service to be failed if the caller is irresponsible.  
+LastCache is a go module that implements stale-while-revalidate and stale-if-error in-memory cache strategy.   
 
-e.g. In microservice architecture, when there is a need for synchronous call. Last cache will be helpful to have resiliency.  
+### stale-if-error
+In the event of an error when fetching fresh data, the cache serves stale (expired) data for a specified period (Config.ExtendTTL). This ensures a fallback mechanism to provide some data even when the retrieval process encounters errors.  
+`LoadOrStore` function is based on this strategy.  
 
-#### example
+### stale-while-revalidate
+Stale (expired) data is served to caller while a background process runs to refresh the cache.      
+`AsyncLoadOrStore` function is based on this strategy.
+
+
+### Examples
 ```go
 package main
 
@@ -16,40 +23,51 @@ import (
 )
 
 func main() {
-
 	lc := lastcache.New(lastcache.Config{
-		GlobalTTL: 1*time.Nanosecond,
+		GlobalTTL      : 1*time.Minute,
+		ExtendTTL      : 10*time.Second,
+		AsyncSemaphore : 1,
 	})
-	//////////////////////
+	/////////////////////////////////////////////////////
+	////////////////// stale-if-error ///////////////////
 	// successful callback
-	val, err := lc.LoadOrStore("key", func(key any) (any, bool, error) {
-		// return new value
+	val, err := lc.LoadOrStore("key", func(key any) (value any, useStale bool, err error) {
 		return "value", false, nil
 	})
-	fmt.Printf("callback healthy, %+v, err: %v\n", val, err)
+	fmt.Printf("sync, %+v, err: %v\n", val, err)
+
 	
+	// failed callback - use stale
+	val, err = lc.LoadOrStore("key", func(key any) (value any, useStale bool, err error) {
+		return nil, true, errors.New("connection lost")
+	})
+	fmt.Printf("sync, %+v, err: %v\n", val, err)
+
 	
-	// wait for cache to be expired
-	time.Sleep(2*time.Nanosecond)
-
-
-	////////////////////////////////////
-	// failed callback, using last cache
-	// the cache is expired but fails to get fresh data
-	val, err = lc.LoadOrStore("key", func(key any) (any, bool, error) {
-		// return err and use last available cache
-		return nil, true, errors.New("service unavailable")
+	// failed callback - do not use stale
+	val, err = lc.LoadOrStore("key", func(key any) (value any, useStale bool, err error) {
+		return nil, false, errors.New("resource not found")
 	})
-	fmt.Printf("callback failed, use cache, %+v, err: %v\n", val, err)
+	fmt.Printf("sync, %+v, err: %v\n", val, err)
 
-	////////////////////////////////////////
-	// failed callback, not using last cache
-	// the cache is expired but failure to get fresh data, not using cache
-	val, err = lc.LoadOrStore("key", func(key any) (any, bool, error) {
-		// return err and not use last cache
-		return nil, false, errors.New("service unavailable")
+
+	/////////////////////////////////////////////////////
+	///////////////// stale-while-revalidate ////////////
+	// successful callback
+	val, errChannel, err := lc.AsyncLoadOrStore("key", func(key any) (value any, err error) {
+		return "value", nil
 	})
-	fmt.Printf("callback failed, don't use cache, %+v, err: %v\n", val, err)
+	callbackErr := <-errChannel
+	fmt.Printf("async, %+v, callback:%v, err: %v\n", val, callbackErr, err)
+
+	
+	// failed callback
+	val, errChannel, err = lc.AsyncLoadOrStore("key", func(key any) (value any, err error) {
+		return nil, errors.New("some query error")
+	})
+	callbackErr = <-errChannel
+	fmt.Printf("async, %+v, callback:%v, err: %v\n", val, callbackErr, err)
+
 }
 
 ```
