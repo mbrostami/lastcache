@@ -13,6 +13,73 @@ var fixedTime = func() time.Time {
 	return time.Unix(1000, 0)
 }
 
+func TestCache_Range(t *testing.T) {
+	type fields struct {
+		config Config
+	}
+	type args struct {
+		keys       []any
+		values     []any
+		beforeTime func() time.Time
+		afterTime  func() time.Time
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		args    args
+		want    map[any]any
+		wantTTL map[any]time.Duration
+		wantErr bool
+	}{
+		{
+			name: "SyncCallback with error valid cache",
+			fields: fields{
+				config: Config{
+					GlobalTTL: 100 * time.Millisecond,
+				},
+			},
+			args: args{
+				keys:       []any{"key1", "key2"},
+				values:     []any{"value1", "value2"},
+				beforeTime: func() time.Time { return fixedTime() },
+				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
+			},
+			want:    map[any]any{"key1": "value1", "key2": "value2"},
+			wantTTL: map[any]time.Duration{"key1": 90 * time.Millisecond, "key2": 90 * time.Millisecond},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Cache{
+				config: tt.fields.config,
+			}
+			now = tt.args.beforeTime
+
+			for i := 0; i < len(tt.args.keys); i++ {
+				c.Set(tt.args.keys[i], tt.args.values[i])
+			}
+
+			now = tt.args.afterTime
+
+			got := make(map[any]any, len(tt.args.keys))
+			gotTTL := make(map[any]time.Duration, len(tt.args.keys))
+			c.Range(func(key, value any, ttl time.Duration) bool {
+				got[key] = value
+				gotTTL[key] = ttl
+				return true
+			})
+
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Range() got = %v, want %v", got, tt.want)
+			}
+			if !reflect.DeepEqual(gotTTL, tt.wantTTL) {
+				t.Errorf("Range() got = %v, want %v", gotTTL, tt.wantTTL)
+			}
+		})
+	}
+}
+
 func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
 	type fields struct {
 		config Config
@@ -216,7 +283,7 @@ func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
 				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if got != nil && !reflect.DeepEqual(got.Value, tt.want) {
+			if !reflect.DeepEqual(got.Value, tt.want) {
 				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
 			}
 		})
@@ -312,7 +379,7 @@ func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
 				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if got != nil && !reflect.DeepEqual(*got, tt.want) {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
 			}
 		})
@@ -377,7 +444,7 @@ func TestCache_LoadOrStore(t *testing.T) {
 				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if got != nil && !reflect.DeepEqual(got.Value, tt.want) {
+			if !reflect.DeepEqual(got.Value, tt.want) {
 				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
 			}
 		})
@@ -489,7 +556,7 @@ func TestCache_LoadOrStore_NrCalls(t *testing.T) {
 				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if got != nil && !reflect.DeepEqual(got.Value, tt.want) {
+			if !reflect.DeepEqual(got.Value, tt.want) {
 				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
 			}
 
@@ -777,8 +844,8 @@ func TestCache_AsyncLoadOrStoreNonExistingKeyWithError(t *testing.T) {
 		t.Errorf("want err, got nil")
 	}
 
-	if entry != nil {
-		t.Errorf("want nil entry, got %+v", entry)
+	if entry.Value != nil {
+		t.Errorf("want nil entry, got %v", entry.Value)
 	}
 }
 

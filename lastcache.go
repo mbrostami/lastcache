@@ -113,6 +113,23 @@ func (c *Cache) Delete(key any) {
 	c.timeStorage.Delete(key)
 }
 
+// Range calls f sequentially for each key and value and ttl present in the map.
+// If f returns false, range stops the iteration.
+//
+// Range does not necessarily correspond to any consistent snapshot of the Map's
+// contents: no key will be visited more than once, but if the value for any key
+// is stored or deleted concurrently (including by f), Range may reflect any
+// mapping for that key from any point during the Range call. Range does not
+// block other methods on the receiver; even f itself may call any method on Cache.
+//
+// Range may be O(N) with the number of elements in the map even if f returns
+// false after a constant number of calls.
+func (c *Cache) Range(f func(key, value any, ttl time.Duration) bool) {
+	c.mapStorage.Range(func(key, value any) bool {
+		return f(key, value, c.TTL(key))
+	})
+}
+
 // TTL returns ttl in duration format. The returned value can be negative as well, which in that case
 // means item is already expired. Positive values are valid items in the cache.
 func (c *Cache) TTL(key any) time.Duration {
@@ -140,12 +157,12 @@ func (c *Cache) TTL(key any) time.Duration {
 //			   	entry and nil will be returned
 //	       3.3 if SyncCallback returns error with false useStale,
 //				error will be returned
-func (c *Cache) LoadOrStore(key any, callback SyncCallback) (*Entry, error) {
+func (c *Cache) LoadOrStore(key any, callback SyncCallback) (Entry, error) {
 	return c.loadOrStore(c.context(), key, callback)
 }
 
 // LoadOrStoreWithCtx check LoadOrStore
-func (c *Cache) LoadOrStoreWithCtx(ctx context.Context, key any, callback SyncCallback) (*Entry, error) {
+func (c *Cache) LoadOrStoreWithCtx(ctx context.Context, key any, callback SyncCallback) (Entry, error) {
 	return c.loadOrStore(ctx, key, callback)
 }
 
@@ -161,16 +178,16 @@ func (c *Cache) LoadOrStoreWithCtx(ctx context.Context, key any, callback SyncCa
 //		   and existing cache will be returned immediately
 //		   a buffered error channel size 1 will be returned if cache is stale,
 //	       nil or error will be sent to the error channel
-func (c *Cache) AsyncLoadOrStore(key any, callback AsyncCallback) (*Entry, chan error, error) {
+func (c *Cache) AsyncLoadOrStore(key any, callback AsyncCallback) (Entry, chan error, error) {
 	return c.asyncLoadOrStore(c.context(), key, callback)
 }
 
 // AsyncLoadOrStoreWithCtx check AsyncLoadOrStore
-func (c *Cache) AsyncLoadOrStoreWithCtx(ctx context.Context, key any, callback AsyncCallback) (*Entry, chan error, error) {
+func (c *Cache) AsyncLoadOrStoreWithCtx(ctx context.Context, key any, callback AsyncCallback) (Entry, chan error, error) {
 	return c.asyncLoadOrStore(ctx, key, callback)
 }
 
-func (c *Cache) asyncLoadOrStore(ctx context.Context, key any, callback AsyncCallback) (*Entry, chan error, error) {
+func (c *Cache) asyncLoadOrStore(ctx context.Context, key any, callback AsyncCallback) (Entry, chan error, error) {
 	var err error
 	var entry Entry
 
@@ -180,13 +197,13 @@ func (c *Cache) asyncLoadOrStore(ctx context.Context, key any, callback AsyncCal
 		// first time miss
 		newValue, err = callback(ctx, key)
 		if err != nil {
-			return nil, nil, err
+			return entry, nil, err
 		}
 
 		// store cache
 		c.Set(key, newValue)
 		entry.Value = newValue
-		return &entry, nil, nil
+		return entry, nil, nil
 	}
 
 	d, _ := v.(time.Time)
@@ -199,10 +216,10 @@ func (c *Cache) asyncLoadOrStore(ctx context.Context, key any, callback AsyncCal
 
 	v, _ = c.mapStorage.Load(key)
 	entry.Value = v
-	return &entry, ch, nil
+	return entry, ch, nil
 }
 
-func (c *Cache) loadOrStore(ctx context.Context, key any, callback SyncCallback) (*Entry, error) {
+func (c *Cache) loadOrStore(ctx context.Context, key any, callback SyncCallback) (Entry, error) {
 	var newValue any
 	var err error
 	var entry Entry
@@ -212,13 +229,13 @@ func (c *Cache) loadOrStore(ctx context.Context, key any, callback SyncCallback)
 		// first time miss
 		newValue, _, err = callback(ctx, key)
 		if err != nil {
-			return nil, err
+			return entry, err
 		}
 
 		// store cache
 		c.Set(key, newValue)
 		entry.Value = newValue
-		return &entry, nil
+		return entry, nil
 	}
 
 	d, _ := v.(time.Time)
@@ -229,11 +246,11 @@ func (c *Cache) loadOrStore(ctx context.Context, key any, callback SyncCallback)
 			// store cache and set new ttl
 			c.Set(key, newValue)
 			entry.Value = newValue
-			return &entry, nil
+			return entry, nil
 		}
 
 		if !useStale {
-			return nil, err
+			return entry, err
 		}
 
 		entry.Stale = true
@@ -247,7 +264,7 @@ func (c *Cache) loadOrStore(ctx context.Context, key any, callback SyncCallback)
 
 	v, _ = c.mapStorage.Load(key)
 	entry.Value = v
-	return &entry, nil
+	return entry, nil
 }
 
 func (c *Cache) checkIfExpired(key any) bool {
