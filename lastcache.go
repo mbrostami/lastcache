@@ -1,12 +1,14 @@
-// Package lastcache implements stale-while-revalidate and stale-if-error in-memory cache strategy.
+// Package lastcache implements an in-memory cache with stale-if-error and
+// stale-while-revalidate strategies, plus per-key single-flight so a burst of
+// concurrent requests for the same key triggers at most one fetch.
 //
-//	stale-if-error
-//	In the event of an error when fetching fresh data, the cache serves stale (expired) data for a specified period (Config.ExtendTTL). This ensures a fallback mechanism to provide some data even when the retrieval process encounters errors.
-//	`LoadOrStore` function is based on this strategy.
+//	stale-if-error (Get / GetStale)
+//	When a fetch fails and a previous value is still around, the cache serves
+//	that stale value for up to Config.StaleTTL instead of returning the error.
 //
-//	stale-while-revalidate
-//	Stale (expired) data is served to caller while a background process runs to refresh the cache.
-//	`AsyncLoadOrStore` function is based on this strategy.
+//	stale-while-revalidate (GetAsync)
+//	An expired value is returned immediately while a single background goroutine
+//	refreshes it.
 package lastcache
 
 import (
@@ -17,295 +19,248 @@ import (
 
 const defaultTTL = 1 * time.Minute
 
-const defaultSemaphore int = 1
+// Fetch retrieves the value for a key. It is called by the cache on a miss or
+// when a value has expired.
+type Fetch[K comparable, V any] func(ctx context.Context, key K) (V, error)
 
-var now = time.Now
-
-// SyncCallback given key, should return the value
-// true useStale can be used to retrieve the stale cache
-type SyncCallback func(ctx context.Context, key any) (value any, useStale bool, err error)
-
-// AsyncCallback given a key, should return the value
-// This will be called in a goroutine, considering the AsyncSemaphore
-type AsyncCallback func(ctx context.Context, key any) (value any, err error)
-
-// Config configuration to construct LastCache
+// Config configures a Cache. The zero value is valid and uses defaults.
 type Config struct {
-	// Will be used to set expire time for all the keys
-	// If set to negative or 0 the defaultTTL will be used
-	GlobalTTL time.Duration
+	// TTL is how long a fetched value stays fresh. Values <= 0 use defaultTTL.
+	TTL time.Duration
 
-	// Will be used to extend the ttl if cache is stale and callback is failed
-	// If set to 0 ttl will not be extended and evey call to LoadOrStore for stale cache will execute the callback
-	// Until the callback can return new value with no error
-	// In most cases this should be set to the same value as GlobalTTL,
-	// Unless the GlobalTTL is too high, or the callback is expensive to be called
-	ExtendTTL time.Duration
+	// StaleTTL is how long a stale value may be served after expiry when a
+	// refresh fails (stale-if-error). 0 disables serving stale: every expired
+	// Get then re-runs the fetch until it succeeds.
+	StaleTTL time.Duration
 
-	// Number of background callbacks allowed in AsyncLoadOrStore
-	// If set to 0 the default value defaultSemaphore will be used
-	// If you want to use AsyncLoadOrStore this will limit the number of callback calls while cache is expired
-	// If callback is too expensive to run, it's better to set to low value (e.g. 1)
-	// If you are using different callback processes for different keys, you might want to optimize this value or use another instance of LastCache
-	AsyncSemaphore int
+	// MaxConcurrentRefresh bounds the number of background refreshes running at
+	// once across all keys (GetAsync). Values <= 0 use 1.
+	MaxConcurrentRefresh int
 
-	// Context to be used in lifetime of the Cache instance
-	// Default is context.TODO()
+	// OnError, if set, is called with the underlying error when a background
+	// refresh (GetAsync) fails. Foreground errors are returned to the caller.
+	OnError func(key any, err error)
+
+	// Context is the base context used for background refreshes, which outlive
+	// the request that triggered them. Defaults to context.Background().
 	Context context.Context
 }
 
-// Entry cache entry
-type Entry struct {
-	// Value retrieved from callback
-	Value any
+// Result carries a value plus whether it was served stale.
+type Result[V any] struct {
+	// Value is the cached or freshly fetched value. It is the zero value of V
+	// when Err is set and nothing could be served.
+	Value V
 
-	// Either the cache entry is stale or not
+	// Stale is true when Value is an expired value served because a refresh
+	// failed (GetStale) or is still in progress (GetAsync).
 	Stale bool
 
-	// Holds the underlying error if stale cache is used when using LoadOrStore
-	// In case of using AsyncLoadOrStore this always will be nil and the underlying error will be returned in channel
+	// Err holds the underlying fetch error when a stale value was served, or
+	// the fetch error on a cold miss. It is nil for fresh values.
 	Err error
 }
 
-// Cache use New function to construct a new Cache
-// Must not be copied after first use
-type Cache struct {
-	config      Config
-	ctx         context.Context
-	mapStorage  sync.Map
-	timeStorage sync.Map
-	semaphore   chan bool
+type item[V any] struct {
+	value  V
+	expiry time.Time
 }
 
-// New returns new Cache, zero value Config can be passed to use default values
-func New(config Config) *Cache {
-	if config.GlobalTTL <= 0 {
-		config.GlobalTTL = defaultTTL
+type call[V any] struct {
+	wg  sync.WaitGroup
+	val V
+	err error
+}
+
+// Cache is a generic, concurrency-safe cache. Use New to construct one; it must
+// not be copied after first use.
+type Cache[K comparable, V any] struct {
+	config     Config
+	clock      func() time.Time
+	baseCtx    context.Context
+	store      sync.Map // K -> item[V]
+	inflight   sync.Map // K -> *call[V], for single-flight foreground fetches
+	refreshing sync.Map // K -> struct{}, one background refresh per key
+	semaphore  chan struct{}
+}
+
+// New returns a new Cache. A zero Config is valid.
+func New[K comparable, V any](config Config) *Cache[K, V] {
+	if config.TTL <= 0 {
+		config.TTL = defaultTTL
 	}
 
-	c := Cache{
-		config: config,
+	sem := config.MaxConcurrentRefresh
+	if sem <= 0 {
+		sem = 1
 	}
 
-	c.ctx = context.TODO()
-	if config.Context != nil {
-		c.ctx = config.Context
+	base := config.Context
+	if base == nil {
+		base = context.Background()
 	}
 
-	semaphore := defaultSemaphore
-	if config.AsyncSemaphore > 0 {
-		semaphore = config.AsyncSemaphore
+	return &Cache[K, V]{
+		config:    config,
+		clock:     time.Now,
+		baseCtx:   base,
+		semaphore: make(chan struct{}, sem),
 	}
-	c.semaphore = make(chan bool, semaphore)
-
-	return &c
 }
 
-// Set sets the value and ttl for a key.
-func (c *Cache) Set(key, value any) {
-	c.mapStorage.Store(key, value)
-	c.timeStorage.Store(key, now().Add(c.config.GlobalTTL))
+// Get returns the value for key, fetching it if missing or expired. On a fetch
+// error it transparently serves a stale value when one is available and
+// Config.StaleTTL > 0; otherwise it returns the error. Concurrent calls for the
+// same key share a single fetch.
+func (c *Cache[K, V]) Get(ctx context.Context, key K, fetch Fetch[K, V]) (V, error) {
+	res, err := c.GetStale(ctx, key, fetch)
+	return res.Value, err
 }
 
-// Delete deletes the value for a key.
-func (c *Cache) Delete(key any) {
-	c.mapStorage.Delete(key)
-	c.timeStorage.Delete(key)
+// GetStale is like Get but reports whether the value was served stale via the
+// returned Result. The error is non-nil only when nothing could be served.
+func (c *Cache[K, V]) GetStale(ctx context.Context, key K, fetch Fetch[K, V]) (Result[V], error) {
+	if it, ok := c.load(key); ok && !c.expired(it) {
+		return Result[V]{Value: it.value}, nil
+	}
+
+	val, err := c.fetchOnce(ctx, key, fetch)
+	if err == nil {
+		return Result[V]{Value: val}, nil
+	}
+
+	// Fetch failed: serve the last known value if we still have one.
+	if c.config.StaleTTL > 0 {
+		if it, ok := c.load(key); ok {
+			// Push the expiry out so a failing upstream isn't hammered.
+			c.put(key, it.value, c.config.StaleTTL)
+			return Result[V]{Value: it.value, Stale: true, Err: err}, nil
+		}
+	}
+
+	var zero V
+	return Result[V]{Value: zero, Err: err}, err
 }
 
-// Range calls f sequentially for each key and value and ttl present in the map.
-// If f returns false, range stops the iteration.
-//
-// Range does not necessarily correspond to any consistent snapshot of the Map's
-// contents: no key will be visited more than once, but if the value for any key
-// is stored or deleted concurrently (including by f), Range may reflect any
-// mapping for that key from any point during the Range call. Range does not
-// block other methods on the receiver; even f itself may call any method on Cache.
-//
-// Range may be O(N) with the number of elements in the map even if f returns
-// false after a constant number of calls.
-func (c *Cache) Range(f func(key, value any, ttl time.Duration) bool) {
-	c.mapStorage.Range(func(key, value any) bool {
-		return f(key, value, c.TTL(key))
-	})
+// GetAsync returns the current value immediately. If it is expired, the stale
+// value is returned (Result.Stale == true) and a single background goroutine
+// refreshes the key. On a cold miss the fetch runs synchronously; if it fails,
+// Result.Err is set. Background refresh errors are reported via Config.OnError.
+func (c *Cache[K, V]) GetAsync(ctx context.Context, key K, fetch Fetch[K, V]) Result[V] {
+	it, ok := c.load(key)
+	if !ok {
+		val, err := c.fetchOnce(ctx, key, fetch)
+		if err != nil {
+			c.onError(key, err)
+			return Result[V]{Err: err}
+		}
+		return Result[V]{Value: val}
+	}
+
+	if c.expired(it) {
+		c.triggerRefresh(key, fetch)
+		return Result[V]{Value: it.value, Stale: true}
+	}
+
+	return Result[V]{Value: it.value}
 }
 
-// TTL returns ttl in duration format. The returned value can be negative as well, which in that case
-// means item is already expired. Positive values are valid items in the cache.
-func (c *Cache) TTL(key any) time.Duration {
-	if v, ok := c.timeStorage.Load(key); ok {
-		d, _ := v.(time.Time)
-		return d.Sub(now())
+// Set stores value for key with the configured TTL.
+func (c *Cache[K, V]) Set(key K, value V) {
+	c.put(key, value, c.config.TTL)
+}
+
+// Delete removes key from the cache.
+func (c *Cache[K, V]) Delete(key K) {
+	c.store.Delete(key)
+}
+
+// TTL returns the remaining time before key expires. A negative value means the
+// item is expired; zero means the key is not present.
+func (c *Cache[K, V]) TTL(key K) time.Duration {
+	if it, ok := c.load(key); ok {
+		return it.expiry.Sub(c.clock())
 	}
 	return 0
 }
 
-// LoadOrStore loads the key from cache with respect to the ttl.
-//
-//		There will be three cases:
-//
-//		1. If key exists and is not expired, the value will be returned as Entry
-//		2. If key doesn't exist, SyncCallback will be called to store the value.
-//		   2.1 If SyncCallback returns error, the error will be returned
-//		   2.2 If SyncCallback returns no error, the value will be stored and returned
-//		3. If key is expired, SyncCallback will be called to replace the value,
-//		   3.1 if SyncCallback returns no error, key will be updated with new value and returned
-//	       3.2 if SyncCallback returns error with true useStale,
-//				cached value will be added to the entry.Value,
-//	   			SyncCallback error will be added to the entry.Err,
-//				ttl will be extended,
-//			   	entry and nil will be returned
-//	       3.3 if SyncCallback returns error with false useStale,
-//				error will be returned
-func (c *Cache) LoadOrStore(key any, callback SyncCallback) (Entry, error) {
-	return c.loadOrStore(c.context(), key, callback)
+// Range calls f for each key with its value and remaining TTL. Iteration stops
+// if f returns false. It follows sync.Map.Range semantics (no consistent
+// snapshot).
+func (c *Cache[K, V]) Range(f func(key K, value V, ttl time.Duration) bool) {
+	c.store.Range(func(k, v any) bool {
+		it := v.(item[V])
+		return f(k.(K), it.value, it.expiry.Sub(c.clock()))
+	})
 }
 
-// LoadOrStoreWithCtx check LoadOrStore
-func (c *Cache) LoadOrStoreWithCtx(ctx context.Context, key any, callback SyncCallback) (Entry, error) {
-	return c.loadOrStore(ctx, key, callback)
-}
-
-// AsyncLoadOrStore loads the key from cache with respect to the ttl and runs the callback in background
-//
-//		There will be three cases:
-//
-//		1. If key exists and is not expired, the value will be returned as Entry
-//		2. If key doesn't exist, callback will be called to store the value.
-//		   2.1 If SyncCallback returns error, the error will be returned
-//		   2.2 If SyncCallback returns no error, the value will be stored and returned
-//		3. If key is expired, callback will be called in background to replace the value,
-//		   and existing cache will be returned immediately
-//		   a buffered error channel size 1 will be returned if cache is stale,
-//	       nil or error will be sent to the error channel
-func (c *Cache) AsyncLoadOrStore(key any, callback AsyncCallback) (Entry, chan error, error) {
-	return c.asyncLoadOrStore(c.context(), key, callback)
-}
-
-// AsyncLoadOrStoreWithCtx check AsyncLoadOrStore
-func (c *Cache) AsyncLoadOrStoreWithCtx(ctx context.Context, key any, callback AsyncCallback) (Entry, chan error, error) {
-	return c.asyncLoadOrStore(ctx, key, callback)
-}
-
-func (c *Cache) asyncLoadOrStore(ctx context.Context, key any, callback AsyncCallback) (Entry, chan error, error) {
-	var err error
-	var entry Entry
-
-	v, ok := c.timeStorage.Load(key)
-	if !ok {
-		var newValue any
-		// first time miss
-		newValue, err = callback(ctx, key)
-		if err != nil {
-			return entry, nil, err
-		}
-
-		// store cache
-		c.Set(key, newValue)
-		entry.Value = newValue
-		return entry, nil, nil
+// fetchOnce runs fetch for key, collapsing concurrent calls for the same key
+// into a single fetch and caching a successful result.
+func (c *Cache[K, V]) fetchOnce(ctx context.Context, key K, fetch Fetch[K, V]) (V, error) {
+	cl := &call[V]{}
+	cl.wg.Add(1)
+	actual, loaded := c.inflight.LoadOrStore(key, cl)
+	if loaded {
+		existing := actual.(*call[V])
+		existing.wg.Wait()
+		return existing.val, existing.err
 	}
 
-	d, _ := v.(time.Time)
-	var ch chan error
-	if now().After(d) { // expired
-		ch = make(chan error, 1)
-		go c.updateCache(ctx, key, callback, ch)
-		entry.Stale = true
+	cl.val, cl.err = fetch(ctx, key)
+	if cl.err == nil {
+		c.Set(key, cl.val)
 	}
-
-	v, _ = c.mapStorage.Load(key)
-	entry.Value = v
-	return entry, ch, nil
+	c.inflight.Delete(key)
+	cl.wg.Done()
+	return cl.val, cl.err
 }
 
-func (c *Cache) loadOrStore(ctx context.Context, key any, callback SyncCallback) (Entry, error) {
-	var newValue any
-	var err error
-	var entry Entry
-
-	v, ok := c.timeStorage.Load(key)
-	if !ok {
-		// first time miss
-		newValue, _, err = callback(ctx, key)
-		if err != nil {
-			return entry, err
-		}
-
-		// store cache
-		c.Set(key, newValue)
-		entry.Value = newValue
-		return entry, nil
-	}
-
-	d, _ := v.(time.Time)
-	if now().After(d) { // expired
-		var useStale bool
-		newValue, useStale, err = callback(ctx, key)
-		if err == nil {
-			// store cache and set new ttl
-			c.Set(key, newValue)
-			entry.Value = newValue
-			return entry, nil
-		}
-
-		if !useStale {
-			return entry, err
-		}
-
-		entry.Stale = true
-		entry.Err = err
-	}
-
-	// extend stale cache ttl
-	if entry.Stale && c.config.ExtendTTL > 0 {
-		c.updateTTL(key, c.config.ExtendTTL)
-	}
-
-	v, _ = c.mapStorage.Load(key)
-	entry.Value = v
-	return entry, nil
-}
-
-func (c *Cache) checkIfExpired(key any) bool {
-	v, ok := c.timeStorage.Load(key)
-	if !ok {
-		return true
-	}
-
-	d, _ := v.(time.Time)
-	return now().After(d)
-}
-
-func (c *Cache) updateCache(ctx context.Context, key any, callback AsyncCallback, errChan chan error) {
-	c.semaphore <- true
-	var err error
-	defer func() {
-		<-c.semaphore
-		errChan <- err
-	}()
-
-	// only execute callback if cache is expired
-	if !c.checkIfExpired(key) {
+// triggerRefresh starts at most one background refresh per key, bounded across
+// keys by the semaphore.
+func (c *Cache[K, V]) triggerRefresh(key K, fetch Fetch[K, V]) {
+	if _, busy := c.refreshing.LoadOrStore(key, struct{}{}); busy {
 		return
 	}
 
-	// extend stale cache ttl
-	if c.config.ExtendTTL > 0 {
-		c.updateTTL(key, c.config.ExtendTTL)
-	}
+	go func() {
+		defer c.refreshing.Delete(key)
 
-	newValue, err := callback(ctx, key)
-	if err == nil {
-		// store cache and set new ttl
-		c.Set(key, newValue)
-	}
+		c.semaphore <- struct{}{}
+		defer func() { <-c.semaphore }()
+
+		// Another refresh may have already updated the key while we waited.
+		if it, ok := c.load(key); ok && !c.expired(it) {
+			return
+		}
+
+		val, err := fetch(c.baseCtx, key)
+		if err != nil {
+			c.onError(key, err)
+			return
+		}
+		c.Set(key, val)
+	}()
 }
 
-func (c *Cache) context() context.Context {
-	return c.ctx
+func (c *Cache[K, V]) load(key K) (item[V], bool) {
+	v, ok := c.store.Load(key)
+	if !ok {
+		var zero item[V]
+		return zero, false
+	}
+	return v.(item[V]), true
 }
 
-func (c *Cache) updateTTL(key any, ttl time.Duration) {
-	c.timeStorage.Store(key, now().Add(ttl))
+func (c *Cache[K, V]) put(key K, value V, ttl time.Duration) {
+	c.store.Store(key, item[V]{value: value, expiry: c.clock().Add(ttl)})
+}
+
+func (c *Cache[K, V]) expired(it item[V]) bool {
+	return c.clock().After(it.expiry)
+}
+
+func (c *Cache[K, V]) onError(key K, err error) {
+	if c.config.OnError != nil {
+		c.config.OnError(key, err)
+	}
 }
