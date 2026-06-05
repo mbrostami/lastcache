@@ -3,1150 +3,283 @@ package lastcache
 import (
 	"context"
 	"errors"
-	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-var fixedTime = func() time.Time {
-	return time.Unix(1000, 0)
+var fixedTime = time.Unix(1000, 0)
+
+// withClock pins the cache to a controllable clock for deterministic tests.
+func withClock[K comparable, V any](c *Cache[K, V], t *time.Time) {
+	c.clock = func() time.Time { return *t }
 }
 
-func TestCache_Range(t *testing.T) {
-	type fields struct {
-		config Config
+func TestNew_Defaults(t *testing.T) {
+	c := New[string, string](Config{})
+	if c.config.TTL != defaultTTL {
+		t.Errorf("TTL = %v, want %v", c.config.TTL, defaultTTL)
 	}
-	type args struct {
-		keys       []any
-		values     []any
-		beforeTime func() time.Time
-		afterTime  func() time.Time
+	if cap(c.semaphore) != 1 {
+		t.Errorf("semaphore cap = %d, want 1", cap(c.semaphore))
 	}
-	tests := []struct {
-		name    string
-		fields  fields
-		args    args
-		want    map[any]any
-		wantTTL map[any]time.Duration
-		wantErr bool
-	}{
-		{
-			name: "SyncCallback with error valid cache",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 100 * time.Millisecond,
-				},
-			},
-			args: args{
-				keys:       []any{"key1", "key2"},
-				values:     []any{"value1", "value2"},
-				beforeTime: func() time.Time { return fixedTime() },
-				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-			},
-			want:    map[any]any{"key1": "value1", "key2": "value2"},
-			wantTTL: map[any]time.Duration{"key1": 90 * time.Millisecond, "key2": 90 * time.Millisecond},
-			wantErr: false,
-		},
+	if c.baseCtx == nil {
+		t.Error("baseCtx must not be nil")
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Cache{
-				config: tt.fields.config,
-			}
-			now = tt.args.beforeTime
 
-			for i := 0; i < len(tt.args.keys); i++ {
-				c.Set(tt.args.keys[i], tt.args.values[i])
-			}
-
-			now = tt.args.afterTime
-
-			got := make(map[any]any, len(tt.args.keys))
-			gotTTL := make(map[any]time.Duration, len(tt.args.keys))
-			c.Range(func(key, value any, ttl time.Duration) bool {
-				got[key] = value
-				gotTTL[key] = ttl
-				return true
-			})
-
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("Range() got = %v, want %v", got, tt.want)
-			}
-			if !reflect.DeepEqual(gotTTL, tt.wantTTL) {
-				t.Errorf("Range() got = %v, want %v", gotTTL, tt.wantTTL)
-			}
-		})
+	neg := New[string, string](Config{TTL: -5 * time.Second})
+	if neg.config.TTL != defaultTTL {
+		t.Errorf("negative TTL should fall back to default, got %v", neg.config.TTL)
 	}
 }
 
-func TestCache_Set_LoadOrStore_Expired(t *testing.T) {
-	type fields struct {
-		config Config
-	}
-	type args struct {
-		key        any
-		value      any
-		beforeTime func() time.Time
-		afterTime  func() time.Time
+func TestGet_FreshHit_NoFetch(t *testing.T) {
+	now := fixedTime
+	c := New[string, int](Config{TTL: time.Minute})
+	withClock(c, &now)
+	c.Set("k", 1)
 
-		callback SyncCallback
-	}
-	tests := []struct {
-		name    string
-		fields  fields
-		args    args
-		want    any
-		wantErr bool
-	}{
-		{
-			name: "SyncCallback with error valid cache",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Millisecond,
-				},
-			},
-			args: args{
-				key:        "storeKey",
-				value:      "value",
-				beforeTime: func() time.Time { return fixedTime() },
-				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return nil, true, errors.New("unavailable")
-				},
-			},
-			want:    "value",
-			wantErr: false,
-		},
-		{
-			name: "expired cache, SyncCallback with new value",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Millisecond,
-				},
-			},
-			args: args{
-				key:        "storeKey",
-				value:      "value",
-				beforeTime: func() time.Time { return fixedTime() },
-				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return "value2", false, nil
-				},
-			},
-			want:    "value2",
-			wantErr: false,
-		},
-		{
-			name: "non expired cache, SyncCallback with new value",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Second,
-				},
-			},
-			args: args{
-				key:        "storeKey",
-				value:      "value",
-				beforeTime: func() time.Time { return fixedTime() },
-				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return "value2", false, nil
-				},
-			},
-			want:    "value",
-			wantErr: false,
-		},
-
-		{
-			name: "non expired cache, SyncCallback with new value",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Second,
-				},
-			},
-			args: args{
-				key:        "storeKey",
-				value:      "value",
-				beforeTime: func() time.Time { return fixedTime() },
-				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return "value2", false, nil
-				},
-			},
-			want:    "value",
-			wantErr: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Cache{
-				config: tt.fields.config,
-			}
-			now = tt.args.beforeTime
-
-			c.Set(tt.args.key, tt.args.value)
-
-			now = tt.args.afterTime
-
-			got, err := c.LoadOrStore(tt.args.key, tt.args.callback)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got.Value, tt.want) {
-				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestCache_Set_LoadOrStore_NonExpired(t *testing.T) {
-	type fields struct {
-		config Config
-	}
-	type args struct {
-		key      any
-		value    any
-		callback SyncCallback
-	}
-	tests := []struct {
-		name    string
-		fields  fields
-		args    args
-		want    any
-		wantErr bool
-	}{
-		{
-			name: "SyncCallback with err using last cache",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 10 * time.Millisecond,
-				},
-			},
-			args: args{
-				key:   "storeKey",
-				value: "value",
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return nil, true, errors.New("unavailable")
-				},
-			},
-			want:    "value",
-			wantErr: false,
-		},
-		{
-			name: "SyncCallback with err not using last cache",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Nanosecond,
-				},
-			},
-			args: args{
-				key:   "storeKey",
-				value: "value",
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return nil, false, errors.New("unavailable")
-				},
-			},
-			want:    nil,
-			wantErr: true,
-		},
-		{
-			name: "SyncCallback with no err",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 10 * time.Millisecond,
-				},
-			},
-			args: args{
-				key:   "storeKey",
-				value: "value",
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return "value", false, nil
-				},
-			},
-			want:    "value",
-			wantErr: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Cache{
-				config: tt.fields.config,
-			}
-			now = func() time.Time { return fixedTime() }
-			c.Set(tt.args.key, tt.args.value)
-			now = func() time.Time {
-				return fixedTime().Add(tt.fields.config.GlobalTTL + 1)
-			}
-			got, err := c.LoadOrStore(tt.args.key, tt.args.callback)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got.Value, tt.want) {
-				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestCache_Set_LoadOrStore_InvalidKey(t *testing.T) {
-	type fields struct {
-		config Config
-	}
-	type args struct {
-		storeKey  any
-		lookupKey any
-		value     any
-		callback  SyncCallback
-	}
-	tests := []struct {
-		name    string
-		fields  fields
-		args    args
-		want    Entry
-		wantErr bool
-	}{
-		{
-			name: "SyncCallback with err",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 10 * time.Millisecond,
-				},
-			},
-			args: args{
-				storeKey:  "storeKey",
-				lookupKey: "key2",
-				value:     "value",
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return nil, false, errors.New("unavailable")
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "SyncCallback with err",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 10 * time.Millisecond,
-				},
-			},
-			args: args{
-				storeKey:  "storeKey",
-				lookupKey: "key2",
-				value:     "value",
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return "value for key2", false, nil
-				},
-			},
-			want:    Entry{Value: "value for key2"},
-			wantErr: false,
-		},
-		{
-			name: "SyncCallback with err use last cache",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 10 * time.Millisecond,
-				},
-			},
-			args: args{
-				storeKey:  "key",
-				lookupKey: "key",
-				value:     "value",
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return nil, true, errors.New("unavailable")
-				},
-			},
-			want:    Entry{Value: "value", Stale: true, Err: errors.New("unavailable")},
-			wantErr: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Cache{
-				config: tt.fields.config,
-			}
-			now = func() time.Time { return fixedTime() }
-			c.Set(tt.args.storeKey, tt.args.value)
-
-			// expire the key
-			now = func() time.Time {
-				return fixedTime().Add(tt.fields.config.GlobalTTL + 1)
-			}
-
-			got, err := c.LoadOrStore(tt.args.lookupKey, tt.args.callback)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestCache_LoadOrStore(t *testing.T) {
-	type fields struct {
-		config Config
-	}
-	type args struct {
-		key      any
-		callback SyncCallback
-	}
-	tests := []struct {
-		name    string
-		fields  fields
-		args    args
-		want    any
-		wantErr bool
-	}{
-		{
-			name: "SyncCallback with error non existing cache",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Millisecond,
-				},
-			},
-			args: args{
-				key: "storeKey",
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return nil, false, errors.New("unavailable")
-				},
-			},
-			want:    nil,
-			wantErr: true,
-		},
-		{
-			name: "SyncCallback no error",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Millisecond,
-				},
-			},
-			args: args{
-				key: "storeKey",
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					return "value", false, nil
-				},
-			},
-			want:    "value",
-			wantErr: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Cache{
-				config: tt.fields.config,
-			}
-			got, err := c.LoadOrStore(tt.args.key, tt.args.callback)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got.Value, tt.want) {
-				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestCache_LoadOrStore_NrCalls(t *testing.T) {
-	type fields struct {
-		config Config
-	}
-	nrCalls := 0
-	type args struct {
-		key        any
-		value      any
-		beforeTime func() time.Time
-		firstTime  func() time.Time
-		secondTime func() time.Time
-		callback   SyncCallback
-	}
-	tests := []struct {
-		name        string
-		fields      fields
-		args        args
-		want        any
-		wantNrCalls int
-		wantErr     bool
-	}{
-		{
-			name: "use stale cache without extended ttl",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Millisecond,
-				},
-			},
-			args: args{
-				key:        "storeKey",
-				value:      "value",
-				beforeTime: func() time.Time { return fixedTime() },
-				firstTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					nrCalls++
-					return nil, true, errors.New("unavailable")
-				},
-			},
-			want:        "value",
-			wantNrCalls: 2, // as extendedTTL is not set
-			wantErr:     false,
-		},
-		{
-			name: "use stale cache with extended ttl",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Millisecond,
-					ExtendTTL: 12 * time.Millisecond,
-				},
-			},
-			args: args{
-				key:        "storeKey",
-				value:      "value",
-				beforeTime: func() time.Time { return fixedTime() },
-				firstTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					nrCalls++
-					return nil, true, errors.New("unavailable")
-				},
-			},
-			want:        "value",
-			wantNrCalls: 1, // as extendedTTL is used, the second call will not execute the callback
-			wantErr:     false,
-		},
-		{
-			name: "use stale cache with extended ttl but expired again",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Millisecond,
-					ExtendTTL: 5 * time.Millisecond,
-				},
-			},
-			args: args{
-				key:        "storeKey",
-				value:      "value",
-				beforeTime: func() time.Time { return fixedTime() },
-				firstTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-				secondTime: func() time.Time { return fixedTime().Add(16 * time.Millisecond) },
-				callback: func(ctx context.Context, key any) (any, bool, error) {
-					nrCalls++
-					return nil, true, errors.New("unavailable")
-				},
-			},
-			want:        "value",
-			wantNrCalls: 2, // as extendedTTL is used but expired before the second call
-			wantErr:     false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Cache{
-				config: tt.fields.config,
-			}
-			now = tt.args.beforeTime
-			c.Set(tt.args.key, tt.args.value)
-
-			now = tt.args.firstTime
-
-			nrCalls = 0
-			// read from SyncCallback
-			got, err := c.LoadOrStore(tt.args.key, tt.args.callback)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("LoadOrStore() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got.Value, tt.want) {
-				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
-			}
-
-			if tt.args.secondTime != nil {
-				now = tt.args.secondTime
-			}
-
-			// read from cache
-			c.LoadOrStore(tt.args.key, tt.args.callback)
-
-			if nrCalls != tt.wantNrCalls {
-				t.Errorf("Number of SyncCallback calls got = %v, want %v", nrCalls, tt.wantNrCalls)
-			}
-		})
-	}
-}
-
-func TestCache_Expiry(t *testing.T) {
-	type fields struct {
-		config Config
-	}
-
-	type args struct {
-		storeKey   any
-		lookupKey  any
-		value      any
-		beforeTime func() time.Time
-		afterTime  func() time.Time
-	}
-	tests := []struct {
-		name   string
-		fields fields
-		args   args
-		want   time.Duration
-	}{
-		{
-			name: "expired 9ms ago",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Millisecond,
-				},
-			},
-			args: args{
-				storeKey:   "storeKey",
-				lookupKey:  "storeKey",
-				value:      "value",
-				beforeTime: func() time.Time { return fixedTime() },
-				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-			},
-			want: -9 * time.Millisecond,
-		},
-		{
-			name: "expired 9s ago",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Second,
-				},
-			},
-			args: args{
-				storeKey:   "storeKey",
-				lookupKey:  "storeKey",
-				value:      "value",
-				beforeTime: func() time.Time { return fixedTime() },
-				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Second) },
-			},
-			want: -9 * time.Second,
-		},
-		{
-			name: "not expire yet",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Second,
-				},
-			},
-			args: args{
-				storeKey:   "storeKey",
-				lookupKey:  "storeKey",
-				value:      "value",
-				beforeTime: func() time.Time { return fixedTime() },
-				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-			},
-			want: 990 * time.Millisecond,
-		},
-		{
-			name: "not expire yet",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Second,
-				},
-			},
-			args: args{
-				storeKey:   "storeKey",
-				lookupKey:  "nonExistingKey",
-				value:      "value",
-				beforeTime: func() time.Time { return fixedTime() },
-				afterTime:  func() time.Time { return fixedTime().Add(10 * time.Millisecond) },
-			},
-			want: 0,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Cache{
-				config: tt.fields.config,
-			}
-
-			now = tt.args.beforeTime
-			c.Set(tt.args.storeKey, tt.args.value)
-
-			now = tt.args.afterTime
-			got := c.TTL(tt.args.lookupKey)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("LoadOrStore() got = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestCache_Delete(t *testing.T) {
-	type fields struct {
-		config Config
-	}
-
-	type args struct {
-		key   any
-		value any
-	}
-	tests := []struct {
-		name   string
-		fields fields
-		args   args
-		want   bool
-	}{
-		{
-			name: "delete key and lookup",
-			fields: fields{
-				config: Config{
-					GlobalTTL: 1 * time.Millisecond,
-				},
-			},
-			args: args{
-				key:   "storeKey",
-				value: "value",
-			},
-			want: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Cache{
-				config: tt.fields.config,
-			}
-
-			c.Set(tt.args.key, tt.args.value)
-
-			c.Delete(tt.args.key)
-
-			_, ok := c.mapStorage.Load(tt.args.key)
-			if !reflect.DeepEqual(ok, tt.want) {
-				t.Errorf("LoadOrStore() got = %v, want %v", ok, tt.want)
-			}
-			_, ok = c.timeStorage.Load(tt.args.key)
-			if !reflect.DeepEqual(ok, tt.want) {
-				t.Errorf("LoadOrStore() got = %v, want %v", ok, tt.want)
-			}
-		})
-	}
-}
-
-func TestNew(t *testing.T) {
-	type args struct {
-		config Config
-	}
-	tests := []struct {
-		name string
-		args args
-		want Config
-	}{
-		{
-			name: "default ttl",
-			args: args{
-				config: Config{},
-			},
-			want: Config{
-				GlobalTTL: defaultTTL,
-			},
-		},
-		{
-			name: "config with ttl",
-			args: args{
-				config: Config{
-					GlobalTTL: 10 * time.Second,
-				},
-			},
-			want: Config{
-				GlobalTTL: 10 * time.Second,
-			},
-		},
-		{
-			name: "config with negative ttl",
-			args: args{
-				config: Config{
-					GlobalTTL: -10 * time.Second,
-				},
-			},
-			want: Config{
-				GlobalTTL: defaultTTL,
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := New(tt.args.config); !reflect.DeepEqual(got.config, tt.want) {
-				t.Errorf("New() = %v, want %v", got.config, tt.want)
-			}
-		})
-	}
-}
-
-func TestCache_LoadOrStore_Race(t *testing.T) {
-	t.Run("race test", func(t *testing.T) {
-		c := New(Config{})
-		wg := sync.WaitGroup{}
-		wg.Add(100)
-		key := "key"
-		value := "value"
-		for i := 0; i < 100; i++ {
-			go func() {
-				c.Set(key, value)
-				c.LoadOrStore(key, func(ctx context.Context, key any) (any, bool, error) {
-					return value, false, nil
-				})
-				c.TTL(key)
-				c.Delete(key)
-				wg.Done()
-			}()
-		}
-		wg.Wait()
+	now = now.Add(10 * time.Second) // still fresh
+	calls := 0
+	v, err := c.Get(context.Background(), "k", func(context.Context, string) (int, error) {
+		calls++
+		return 2, nil
 	})
-}
-
-func TestCache_AsyncLoadOrStoreNonExistingKey(t *testing.T) {
-	key := "key"
-	val := "value"
-
-	callback := func(_ context.Context, key any) (value any, err error) {
-		return val, nil
+	if err != nil || v != 1 {
+		t.Fatalf("got (%v,%v), want (1,nil)", v, err)
 	}
-
-	cache := New(Config{
-		GlobalTTL: 10 * time.Millisecond,
-	})
-
-	now = func() time.Time { return fixedTime() }
-
-	entry, _, err := cache.AsyncLoadOrStore(key, callback)
-	if err != nil {
-		t.Errorf("failed with err: %v", err)
-	}
-
-	if entry.Value != val {
-		t.Errorf("entry Value got %v, want %v", entry.Value, val)
-	}
-
-	if entry.Stale == true {
-		t.Errorf("entry Stale expected to be false, true returned")
+	if calls != 0 {
+		t.Fatalf("fetch should not run on a fresh hit, ran %d", calls)
 	}
 }
 
-func TestCache_AsyncLoadOrStoreNonExistingKeyWithError(t *testing.T) {
-	key := "key"
+func TestGet_Expired_Refetches(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Millisecond})
+	withClock(c, &now)
+	c.Set("k", "old")
 
-	callback := func(_ context.Context, key any) (value any, err error) {
-		return nil, errors.New("not found")
-	}
-
-	cache := New(Config{
-		GlobalTTL: 10 * time.Millisecond,
+	now = now.Add(time.Second) // expired
+	v, err := c.Get(context.Background(), "k", func(context.Context, string) (string, error) {
+		return "new", nil
 	})
+	if err != nil || v != "new" {
+		t.Fatalf("got (%v,%v), want (new,nil)", v, err)
+	}
+}
 
-	now = func() time.Time { return fixedTime() }
-
-	entry, _, err := cache.AsyncLoadOrStore(key, callback)
+func TestGet_ColdMiss_Error(t *testing.T) {
+	c := New[string, string](Config{})
+	_, err := c.Get(context.Background(), "k", func(context.Context, string) (string, error) {
+		return "", errors.New("boom")
+	})
 	if err == nil {
-		t.Errorf("want err, got nil")
-	}
-
-	if entry.Value != nil {
-		t.Errorf("want nil entry, got %v", entry.Value)
+		t.Fatal("want error on cold miss with failing fetch")
 	}
 }
 
-func TestCache_AsyncLoadOrStore(t *testing.T) {
-	key := "key"
-	val := "value"
+func TestGetStale_ServesStaleOnError(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Millisecond, StaleTTL: time.Minute})
+	withClock(c, &now)
+	c.Set("k", "stored")
 
-	callback := func(_ context.Context, key any) (value any, err error) {
-		time.Sleep(5 * time.Millisecond)
-		return "new_value", nil
-	}
-
-	cache := New(Config{
-		GlobalTTL:      10 * time.Millisecond,
-		ExtendTTL:      10 * time.Millisecond,
-		AsyncSemaphore: 1,
+	now = now.Add(time.Second) // expired
+	res, err := c.GetStale(context.Background(), "k", func(context.Context, string) (string, error) {
+		return "", errors.New("upstream down")
 	})
-
-	//////////// time 0
-	now = func() time.Time { return fixedTime() }
-
-	cache.Set(key, val)
-
-	//////////// time 1
-	// GlobalTTL + 1 makes cache expired
-	now = func() time.Time { return fixedTime().Add(11 * time.Millisecond) }
-
-	entry, ch, err := cache.AsyncLoadOrStore(key, callback)
 	if err != nil {
-		t.Errorf("failed with err: %v", err)
+		t.Fatalf("serving stale should not return an error, got %v", err)
 	}
-
-	if entry.Value != val {
-		t.Errorf("entry Value got %v, want %v", entry.Value, val)
-	}
-
-	if entry.Stale == false {
-		t.Errorf("entry Stale expected to be true, false returned")
-	}
-
-	//////////// time 2
-	// 11 + 5(callback time) + 1
-	<-ch
-	now = func() time.Time { return fixedTime().Add(17 * time.Millisecond) }
-
-	entry, _, err = cache.AsyncLoadOrStore(key, callback)
-	if err != nil {
-		t.Errorf("failed with err: %v", err)
-	}
-
-	if entry.Value != "new_value" {
-		t.Errorf("entry Value got %v, want new_value", entry.Value)
-	}
-
-	if entry.Stale == true {
-		t.Errorf("entry Stale expected to be false, true returned")
+	if res.Value != "stored" || !res.Stale || res.Err == nil {
+		t.Fatalf("got %+v, want stale 'stored' with underlying err", res)
 	}
 }
 
-func TestCache_AsyncLoadOrStoreWithContext(t *testing.T) {
-	key := "key"
-	val := "value"
+func TestGetStale_NoStaleTTL_ReturnsError(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Millisecond}) // StaleTTL = 0
+	withClock(c, &now)
+	c.Set("k", "stored")
 
-	callback := func(ctx context.Context, key any) (value any, err error) {
-		select {
-		case <-ctx.Done():
-			return nil, errors.New("context canceled")
-		default:
-			time.Sleep(5 * time.Millisecond)
-			return "new_value", nil
+	now = now.Add(time.Second)
+	_, err := c.GetStale(context.Background(), "k", func(context.Context, string) (string, error) {
+		return "", errors.New("upstream down")
+	})
+	if err == nil {
+		t.Fatal("with StaleTTL=0 a failing fetch must return the error")
+	}
+}
+
+// The core fix: concurrent requests for the same expired key share one fetch.
+func TestGet_SingleFlight(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Millisecond})
+	withClock(c, &now)
+	c.Set("k", "old")
+	now = now.Add(time.Second) // expired
+
+	var calls int64
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Get(context.Background(), "k", func(context.Context, string) (string, error) {
+				atomic.AddInt64(&calls, 1)
+				time.Sleep(5 * time.Millisecond)
+				return "new", nil
+			})
+		}()
+	}
+	wg.Wait()
+	if n := atomic.LoadInt64(&calls); n != 1 {
+		t.Fatalf("single-flight failed: fetch ran %d times, want 1", n)
+	}
+}
+
+func TestGetAsync_ColdMiss_Sync(t *testing.T) {
+	c := New[string, string](Config{TTL: time.Minute})
+	res := c.GetAsync(context.Background(), "k", func(context.Context, string) (string, error) {
+		return "v", nil
+	})
+	if res.Value != "v" || res.Stale {
+		t.Fatalf("got %+v, want fresh 'v'", res)
+	}
+}
+
+func TestGetAsync_ServesStaleAndRefreshes(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Millisecond, MaxConcurrentRefresh: 1})
+	withClock(c, &now)
+	c.Set("k", "old")
+	now = now.Add(time.Second) // expired
+
+	res := c.GetAsync(context.Background(), "k", func(context.Context, string) (string, error) {
+		return "new", nil
+	})
+	if res.Value != "old" || !res.Stale {
+		t.Fatalf("got %+v, want stale 'old'", res)
+	}
+
+	// Wait for the background refresh to land. We poll the store (concurrency-safe)
+	// rather than writing the clock, which the refresh goroutine reads.
+	deadline := time.Now().Add(time.Second)
+	for {
+		if v, ok := c.load("k"); ok && v.value == "new" {
+			break
 		}
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cache := New(Config{
-		GlobalTTL:      10 * time.Millisecond,
-		ExtendTTL:      10 * time.Millisecond,
-		AsyncSemaphore: 1,
-		Context:        ctx,
-	})
-
-	//////////// time 0
-	now = func() time.Time { return fixedTime() }
-
-	cache.Set(key, val)
-
-	//////////// time 1
-	// GlobalTTL + 1 makes cache expired
-	now = func() time.Time { return fixedTime().Add(11 * time.Millisecond) }
-
-	cancel() // cancel the context, so callback will return error
-
-	entry, ch, err := cache.AsyncLoadOrStore(key, callback)
-	if err != nil {
-		t.Errorf("failed with err: %v", err)
-	}
-
-	if entry.Value != val {
-		t.Errorf("entry Value got %v, want %v", entry.Value, val)
-	}
-
-	if entry.Stale == false {
-		t.Errorf("entry Stale expected to be true, false returned")
-	}
-
-	//////////// time 2
-	if ch != nil {
-		if err := <-ch; err == nil {
-			t.Errorf("err is nil")
+		if time.Now().After(deadline) {
+			t.Fatal("background refresh did not update value within 1s")
 		}
-	}
-	// 11 + 5(callback time) + 1
-	now = func() time.Time { return fixedTime().Add(17 * time.Millisecond) }
-
-	entry, _, err = cache.AsyncLoadOrStore(key, callback)
-	if err != nil {
-		t.Errorf("failed with err: %v", err)
-	}
-
-	if entry.Value != val {
-		t.Errorf("entry Value got %v, want %v", entry.Value, val)
-	}
-
-	if entry.Stale == true {
-		t.Errorf("entry Stale expected to be false, true returned")
+		time.Sleep(time.Millisecond)
 	}
 }
 
-func TestCache_AsyncLoadOrStoreConcurrentOneSemaphore(t *testing.T) {
-	key := "key"
-	val := "value"
-
-	callbackFirst := func(_ context.Context, key any) (value any, err error) {
-		return "new_value_1", nil
-	}
-
-	callbackSecond := func(_ context.Context, key any) (value any, err error) {
-		return "new_value_2", nil
-	}
-
-	cache := New(Config{
-		GlobalTTL:      10 * time.Millisecond,
-		ExtendTTL:      10 * time.Millisecond,
-		AsyncSemaphore: 1,
+func TestGetAsync_OnErrorHook(t *testing.T) {
+	now := fixedTime
+	var gotErr error
+	var mu sync.Mutex
+	fired := make(chan struct{})
+	c := New[string, string](Config{
+		TTL: time.Millisecond,
+		OnError: func(key any, err error) {
+			mu.Lock()
+			gotErr = err
+			mu.Unlock()
+			close(fired)
+		},
 	})
+	withClock(c, &now)
+	c.Set("k", "old")
+	now = now.Add(time.Second)
 
-	//////////// time 0
-	now = func() time.Time { return fixedTime() }
-
-	cache.Set(key, val)
-
-	//////////// time 1
-	// GlobalTTL + 1 makes cache expired
-	now = func() time.Time { return fixedTime().Add(11 * time.Millisecond) }
-
-	// first call
-	entry, ch1, err := cache.AsyncLoadOrStore(key, callbackFirst)
-	if err != nil {
-		t.Errorf("failed with err: %v", err)
-	}
-
-	if entry.Value != val {
-		t.Errorf("entry Value got %v, want %v", entry.Value, val)
-	}
-
-	if entry.Stale == false {
-		t.Errorf("entry Stale expected to be true, false returned")
-	}
-
-	// second call
-	var ch2 chan error
-	entry, ch2, err = cache.AsyncLoadOrStore(key, callbackSecond)
-	if err != nil {
-		t.Errorf("failed with err: %v", err)
-	}
-
-	if entry.Value != val {
-		t.Errorf("entry Value got %v, want %v", entry.Value, val)
-	}
-
-	if entry.Stale == false {
-		t.Errorf("entry Stale expected to be true, false returned")
-	}
-
-	//////////// time 2
-	// 11 + 5(callback time) + 1
-	<-ch1
-	<-ch2 // to avoid rc in tests because of `now`
-	now = func() time.Time { return fixedTime().Add(17 * time.Millisecond) }
-
-	entry, _, err = cache.AsyncLoadOrStore(key, callbackFirst)
-	if err != nil {
-		t.Errorf("failed with err: %v", err)
-	}
-
-	if entry.Value != "new_value_1" && entry.Value != "new_value_2" { // second callback should not run because the first one is already updated the cache
-		t.Errorf("entry Value got %v, want new_value_1 or new_value_2", entry.Value)
-	}
-
-	if entry.Stale == true {
-		t.Errorf("entry Stale expected to be false, true returned")
-	}
-}
-
-func TestCache_AsyncLoadOrStoreConcurrentTwoSemaphore(t *testing.T) {
-	key := "key"
-	val := "value"
-
-	callbackFirst := func(_ context.Context, key any) (value any, err error) {
-		return "new_value_1", nil
-	}
-
-	callbackSecond := func(_ context.Context, key any) (value any, err error) {
-		return "new_value_2", nil
-	}
-
-	cache := New(Config{
-		GlobalTTL:      10 * time.Millisecond,
-		ExtendTTL:      10 * time.Millisecond,
-		AsyncSemaphore: 2,
+	c.GetAsync(context.Background(), "k", func(context.Context, string) (string, error) {
+		return "", errors.New("bg boom")
 	})
-
-	//////////// time 0
-	now = func() time.Time { return fixedTime() }
-
-	cache.Set(key, val)
-
-	//////////// time 1
-	// GlobalTTL + 1 makes cache expired
-	now = func() time.Time { return fixedTime().Add(11 * time.Millisecond) }
-
-	entry, ch1, err := cache.AsyncLoadOrStore(key, callbackFirst)
-	if err != nil {
-		t.Errorf("failed with err: %v", err)
+	select {
+	case <-fired:
+	case <-time.After(time.Second):
+		t.Fatal("OnError was not called")
 	}
-
-	if entry.Value != val {
-		t.Errorf("entry Value got %v, want %v", entry.Value, val)
-	}
-
-	if entry.Stale == false {
-		t.Errorf("entry Stale expected to be true, false returned")
-	}
-
-	// second call
-	var ch2 chan error
-	entry, ch2, err = cache.AsyncLoadOrStore(key, callbackSecond)
-	if err != nil {
-		t.Errorf("failed with err: %v", err)
-	}
-
-	if entry.Value != val {
-		t.Errorf("entry Value got %v, want %v", entry.Value, val)
-	}
-
-	if entry.Stale == false {
-		t.Errorf("entry Stale expected to be true, false returned")
-	}
-
-	//////////// time 2
-	// 11 + 5(callback time) + 1
-	<-ch2 // wait for second call
-	<-ch1 // wait for first call
-	now = func() time.Time { return fixedTime().Add(17 * time.Millisecond) }
-
-	entry, _, err = cache.AsyncLoadOrStore(key, callbackFirst)
-	if err != nil {
-		t.Errorf("failed with err: %v", err)
-	}
-
-	if entry.Value != "new_value_2" && entry.Value != "new_value_1" { // two callbacks run at the same time
-		t.Errorf("entry Value got %v, want new_value_2 or new_value_1", entry.Value)
-	}
-
-	if entry.Stale == true {
-		t.Errorf("entry Stale expected to be false, true returned")
+	mu.Lock()
+	defer mu.Unlock()
+	if gotErr == nil {
+		t.Fatal("OnError received nil error")
 	}
 }
 
-func BenchmarkLoadOrStore(b *testing.B) {
-	c := New(Config{GlobalTTL: 1 * time.Millisecond})
+func TestTTL_And_Delete(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Second})
+	withClock(c, &now)
+	c.Set("k", "v")
+
+	now = now.Add(100 * time.Millisecond)
+	if got := c.TTL("k"); got != 900*time.Millisecond {
+		t.Errorf("TTL = %v, want 900ms", got)
+	}
+	if got := c.TTL("missing"); got != 0 {
+		t.Errorf("TTL(missing) = %v, want 0", got)
+	}
+
+	c.Delete("k")
+	if _, ok := c.load("k"); ok {
+		t.Error("key should be gone after Delete")
+	}
+}
+
+func TestRange(t *testing.T) {
+	now := fixedTime
+	c := New[string, int](Config{TTL: time.Minute})
+	withClock(c, &now)
+	c.Set("a", 1)
+	c.Set("b", 2)
+
+	got := map[string]int{}
+	c.Range(func(key string, value int, ttl time.Duration) bool {
+		got[key] = value
+		if ttl <= 0 {
+			t.Errorf("ttl for %s should be positive, got %v", key, ttl)
+		}
+		return true
+	})
+	if got["a"] != 1 || got["b"] != 2 {
+		t.Errorf("Range got %v", got)
+	}
+}
+
+func TestConcurrency_Race(t *testing.T) {
+	c := New[string, string](Config{})
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Set("k", "v")
+			c.Get(context.Background(), "k", func(context.Context, string) (string, error) {
+				return "v", nil
+			})
+			c.GetAsync(context.Background(), "k2", func(context.Context, string) (string, error) {
+				return "v2", nil
+			})
+			c.TTL("k")
+			c.Delete("k")
+		}()
+	}
+	wg.Wait()
+}
+
+func BenchmarkGet(b *testing.B) {
+	c := New[string, string](Config{TTL: time.Minute})
 	c.Set("key", "value")
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		g, _ := c.LoadOrStore("key", func(ctx context.Context, key any) (any, bool, error) {
-			return "value", false, nil
-		})
-		if g.Value != "value" {
-			b.Errorf("got %v, want %v", g, "value")
-		}
-	}
-}
-
-func BenchmarkAsyncLoadOrStore(b *testing.B) {
-	c := New(Config{GlobalTTL: 1 * time.Millisecond})
-	c.Set("key", "value")
-	for i := 0; i < b.N; i++ {
-		g, _, _ := c.AsyncLoadOrStore("key", func(_ context.Context, key any) (any, error) {
+		if v, _ := c.Get(context.Background(), "key", func(context.Context, string) (string, error) {
 			return "value", nil
-		})
-		if g.Value != "value" {
-			b.Errorf("got %v, want %v", g, "value")
+		}); v != "value" {
+			b.Fatalf("got %v", v)
 		}
 	}
 }

@@ -1,3 +1,3 @@
-module github.com/mbrostami/lastcache
+module github.com/mbrostami/lastcache/v2
 
 go 1.18

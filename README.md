@@ -1,88 +1,101 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/mbrostami/lastcache)](https://goreportcard.com/report/github.com/mbrostami/lastcache)
-![Coverage](https://img.shields.io/badge/Coverage-96.7%25-brightgreen)
 # LastCache
-LastCache is a go module that implements stale-while-revalidate and stale-if-error in-memory cache strategy.   
 
-### stale-if-error
-In the event of an error when fetching fresh data, the cache serves stale (expired) data for a specified period (Config.ExtendTTL). This ensures a fallback mechanism to provide some data even when the retrieval process encounters errors.  
-`LoadOrStore` function is based on this strategy.  
+LastCache is a generic, concurrency-safe in-memory cache implementing
+**stale-if-error** and **stale-while-revalidate**, with built-in **single-flight**
+so a burst of concurrent requests for the same key triggers at most one fetch.
 
-### stale-while-revalidate
-Stale (expired) data is served to caller while a background process runs to refresh the cache.      
-`AsyncLoadOrStore` function is based on this strategy.
+```
+go get github.com/mbrostami/lastcache/v2
+```
 
+### stale-if-error (`Get` / `GetStale`)
+When a fetch fails and a previous value is still around, the cache serves that
+stale value for up to `Config.StaleTTL` instead of returning the error.
 
-### Examples
+### stale-while-revalidate (`GetAsync`)
+An expired value is returned immediately while a single background goroutine
+refreshes it.
+
+## Usage
+
 ```go
 package main
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"time"
-	"context"
 
-	"github.com/mbrostami/lastcache"
+	"github.com/mbrostami/lastcache/v2"
 )
 
 func main() {
-
-
-	var callbackErr error
-	lc := lastcache.New(lastcache.Config{
-		GlobalTTL:      1 * time.Nanosecond, // 1 * time.Minute,
-		ExtendTTL:      1 * time.Nanosecond, // 10 * time.Second,
-		AsyncSemaphore: 1,
-	})
-	/////////////////////////////////////////////////////
-	////////////////// stale-if-error ///////////////////
-	// successful callback
-	val, err := lc.LoadOrStore("key", func(ctx context.Context, key any) (value any, useStale bool, err error) {
-		return "value", false, nil
-	})
-	fmt.Printf("sync, \tValue: %s, \tStale: %v, \tCallbackErr: %v, \terr: %v\n", val.Value, val.Stale, val.Err, err)
-
-	// failed callback - use stale
-	val, err = lc.LoadOrStore("key", func(ctx context.Context, key any) (value any, useStale bool, err error) {
-		return nil, true, errors.New("connection lost")
-	})
-	fmt.Printf("sync, \tValue: %s, \tStale: %v, \tCallbackErr: %v, \terr: %v\n", val.Value, val.Stale, val.Err, err)
-
-	// failed callback - do not use stale
-	val, err = lc.LoadOrStore("key", func(ctx context.Context, key any) (value any, useStale bool, err error) {
-		return nil, false, errors.New("resource not found")
-	})
-	fmt.Printf("sync, \tValue: %+v, \terr: %v\n", val, err)
-
-	/////////////////////////////////////////////////////
-	///////////////// stale-while-revalidate ////////////
-	// successful callback
-	val, errChannel, err := lc.AsyncLoadOrStore("key_2", func(ctx context.Context, key any) (value any, err error) {
-		return "value", nil
+	cache := lastcache.New[string, string](lastcache.Config{
+		TTL:      time.Minute,
+		StaleTTL: 10 * time.Second, // serve stale up to 10s when a refresh fails
 	})
 
-	if errChannel != nil { // check callback error
-		callbackErr = <-errChannel
+	fetch := func(ctx context.Context, key string) (string, error) {
+		// load from db / upstream / etc.
+		return "value-for-" + key, nil
 	}
-	fmt.Printf("async, \tValue: %s, \tStale: %v, \tCallbackErr: %v, \terr: %v\n", val.Value, val.Stale, callbackErr, err)
 
-	// failed callback
-	val, errChannel, err = lc.AsyncLoadOrStore("key_2", func(ctx context.Context, key any) (value any, err error) {
-		return nil, errors.New("some query error")
-	})
-	if errChannel != nil { // check callback error
-		callbackErr = <-errChannel
-	}
-	fmt.Printf("async, \tValue: %s, \tStale: %v, \tCallbackErr: %v, \terr: %v\n", val.Value, val.Stale, callbackErr, err)
+	// Common case: fresh value, or transparently a stale one on error.
+	v, err := cache.Get(context.Background(), "user:42", fetch)
+	fmt.Println(v, err)
+
+	// When you need to know it was served stale:
+	res, err := cache.GetStale(context.Background(), "user:42", fetch)
+	fmt.Println(res.Value, res.Stale, res.Err, err)
+
+	// stale-while-revalidate: returns immediately, refreshes in the background.
+	res = cache.GetAsync(context.Background(), "user:42", fetch)
+	fmt.Println(res.Value, res.Stale)
 }
-
 ```
 
-Output: 
+## API
+
+```go
+func New[K comparable, V any](config Config) *Cache[K, V]
+
+func (c *Cache[K, V]) Get(ctx, key, fetch) (V, error)            // fresh or stale-on-error, single-flighted
+func (c *Cache[K, V]) GetStale(ctx, key, fetch) (Result[V], error) // same, but reports staleness
+func (c *Cache[K, V]) GetAsync(ctx, key, fetch) Result[V]        // serve now, refresh in background
+func (c *Cache[K, V]) Set(key, value)
+func (c *Cache[K, V]) Delete(key)
+func (c *Cache[K, V]) TTL(key) time.Duration
+func (c *Cache[K, V]) Range(func(key K, value V, ttl time.Duration) bool)
 ```
-sync, 	Value: value, 	Stale: false, 	CallbackErr: <nil>, 	err: <nil>
-sync, 	Value: value, 	Stale: true, 	CallbackErr: connection lost, 	err: <nil>
-sync, 	Value: <nil>, 	err: resource not found
-async, 	Value: value, 	Stale: false, 	CallbackErr: <nil>, 	err: <nil>
-async, 	Value: value, 	Stale: true, 	CallbackErr: some query error, 	err: <nil>
+
+`fetch` is a plain `func(ctx context.Context, key K) (V, error)`.
+
+```go
+type Result[V any] struct {
+	Value V
+	Stale bool  // value is expired but served (error or in-progress refresh)
+	Err   error // underlying fetch error when stale; nil for fresh values
+}
 ```
+
+## Config
+
+| Field | Meaning |
+|-------|---------|
+| `TTL` | How long a fetched value stays fresh. Defaults to 1 minute. |
+| `StaleTTL` | How long a stale value may be served after expiry when a refresh fails. `0` disables serving stale. |
+| `MaxConcurrentRefresh` | Caps concurrent background refreshes (`GetAsync`) across all keys. Defaults to `1`. |
+| `OnError` | Optional `func(key any, err error)` called when a background refresh fails. |
+| `Context` | Base context for background refreshes (they outlive the request). Defaults to `context.Background()`. |
+
+## Migrating from v1
+
+v2 is a rewrite:
+
+- Generic `Cache[K, V]` instead of `any` (no more type assertions).
+- `Get` / `GetStale` / `GetAsync` replace `LoadOrStore` / `AsyncLoadOrStore` and the `WithCtx` variants; `ctx` is now a parameter.
+- The fetch callback is `(ctx, key) (V, error)` - the `useStale bool` return is gone; serving stale is controlled by `StaleTTL`.
+- `GetAsync` returns a `Result` instead of a `chan error`; background errors go to `Config.OnError`.
+- Config: `GlobalTTL` -> `TTL`, `ExtendTTL` -> `StaleTTL`, `AsyncSemaphore` -> `MaxConcurrentRefresh`.
+- Built-in single-flight: concurrent requests for the same key share one fetch.
