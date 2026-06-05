@@ -1,5 +1,9 @@
+[![Go Reference](https://pkg.go.dev/badge/github.com/mbrostami/lastcache/v2.svg)](https://pkg.go.dev/github.com/mbrostami/lastcache/v2)
 [![Go Report Card](https://goreportcard.com/badge/github.com/mbrostami/lastcache)](https://goreportcard.com/report/github.com/mbrostami/lastcache)
+![Coverage](https://img.shields.io/badge/Coverage-100%25-brightgreen)
 # LastCache
+
+> **v2** is a generics rewrite with built-in single-flight. On the v1 API? See [Migrating from v1](#migrating-from-v1).
 
 LastCache is a generic, concurrency-safe in-memory cache implementing
 **stale-if-error** and **stale-while-revalidate**, with built-in **single-flight**

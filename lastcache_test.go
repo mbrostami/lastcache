@@ -271,6 +271,112 @@ func TestConcurrency_Race(t *testing.T) {
 	wg.Wait()
 }
 
+func TestGetAsync_ColdMiss_Error(t *testing.T) {
+	var hookCalls int32
+	c := New[string, string](Config{
+		OnError: func(key any, err error) { atomic.AddInt32(&hookCalls, 1) },
+	})
+	res := c.GetAsync(context.Background(), "missing", func(context.Context, string) (string, error) {
+		return "", errors.New("boom")
+	})
+	if res.Err == nil {
+		t.Fatal("want Result.Err on a failed cold-miss fetch")
+	}
+	if res.Value != "" || res.Stale {
+		t.Fatalf("want zero/non-stale result, got %+v", res)
+	}
+	if atomic.LoadInt32(&hookCalls) != 1 {
+		t.Fatalf("OnError fired %d times, want 1", atomic.LoadInt32(&hookCalls))
+	}
+}
+
+// A second GetAsync while a refresh is already in flight must not start another.
+func TestGetAsync_DedupesBackgroundRefresh(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Millisecond})
+	withClock(c, &now)
+	c.Set("k", "old")
+	now = now.Add(time.Second) // expired (no more writes to now after this)
+
+	var calls int32
+	release := make(chan struct{})
+	fetch := func(context.Context, string) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		<-release
+		return "new", nil
+	}
+
+	c.GetAsync(context.Background(), "k", fetch) // starts a background refresh that blocks
+	res := c.GetAsync(context.Background(), "k", fetch) // must find one already running
+	if !res.Stale || res.Value != "old" {
+		t.Fatalf("second call got %+v, want stale 'old'", res)
+	}
+	close(release)
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		if v, ok := c.load("k"); ok && v.value == "new" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background refresh did not land")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("background fetch ran %d times, want 1 (deduped)", n)
+	}
+}
+
+// If the key is refreshed by another path while the background goroutine waits
+// for the refresh slot, the goroutine must skip its fetch and not overwrite.
+func TestGetAsync_SkipsRefreshIfAlreadyFresh(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Millisecond, MaxConcurrentRefresh: 1})
+	withClock(c, &now)
+	c.Set("k", "old")
+	c.Set("other", "x")
+	now = now.Add(time.Second) // both expired (no more writes to now after this)
+
+	// Occupy the single refresh slot with a blocked refresh on "other".
+	otherStarted := make(chan struct{})
+	blockOther := make(chan struct{})
+	c.GetAsync(context.Background(), "other", func(context.Context, string) (string, error) {
+		close(otherStarted)
+		<-blockOther
+		return "x2", nil
+	})
+	<-otherStarted // the slot is now held
+
+	var kFetched int32
+	c.GetAsync(context.Background(), "k", func(context.Context, string) (string, error) {
+		atomic.AddInt32(&kFetched, 1)
+		return "new-from-fetch", nil
+	})
+
+	// Make k fresh via a direct Set while its refresh goroutine waits for the slot.
+	c.Set("k", "fresh-direct")
+	close(blockOther) // release the slot; k's goroutine wakes and re-checks freshness
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, busy := c.refreshing.Load("k"); !busy {
+			break // k's refresh goroutine finished
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("k refresh goroutine never finished")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if n := atomic.LoadInt32(&kFetched); n != 0 {
+		t.Fatalf("k fetch ran %d times, want 0 (already fresh)", n)
+	}
+	if v, _ := c.load("k"); v.value != "fresh-direct" {
+		t.Fatalf("k value = %q, want fresh-direct (stale refresh must not overwrite)", v.value)
+	}
+}
+
 func BenchmarkGet(b *testing.B) {
 	c := New[string, string](Config{TTL: time.Minute})
 	c.Set("key", "value")
