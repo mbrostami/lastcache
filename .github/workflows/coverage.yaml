@@ -15,14 +15,15 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-        go: ['1.18', 'stable']
+        go: ['1.21', 'stable']  # 1.21 is the module floor (context.WithoutCancel)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
+          cache: false  # zero-dependency module: no go.sum for the cache key
 
       - name: Build
         run: go build ./...
