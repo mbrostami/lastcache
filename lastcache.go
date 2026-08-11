@@ -45,6 +45,13 @@ type Config struct {
 	// once across all keys (GetAsync). Values <= 0 use 1.
 	MaxConcurrentRefresh int
 
+	// Capacity bounds the number of entries; values <= 0 mean unbounded.
+	// When the cache is full, dead entries (past the staleness cap) are
+	// evicted first, then arbitrary ones. Set a capacity whenever keys come
+	// from outside (request paths, API keys, user input) so the cache cannot
+	// grow without limit.
+	Capacity int
+
 	// OnError, if set, is called with the underlying error when a background
 	// refresh (GetAsync) fails. Foreground errors are returned to the caller.
 	OnError func(key any, err error)
@@ -86,7 +93,8 @@ type Cache[K comparable, V any] struct {
 	config     Config
 	clock      func() time.Time
 	baseCtx    context.Context
-	store      sync.Map // K -> item[V]
+	mu         sync.RWMutex
+	entries    map[K]item[V]
 	inflight   sync.Map // K -> *call[V], for single-flight foreground fetches
 	refreshing sync.Map // K -> struct{}, one background refresh per key
 	semaphore  chan struct{}
@@ -112,6 +120,7 @@ func New[K comparable, V any](config Config) *Cache[K, V] {
 		config:    config,
 		clock:     time.Now,
 		baseCtx:   base,
+		entries:   make(map[K]item[V]),
 		semaphore: make(chan struct{}, sem),
 	}
 }
@@ -181,7 +190,9 @@ func (c *Cache[K, V]) Set(key K, value V) {
 
 // Delete removes key from the cache.
 func (c *Cache[K, V]) Delete(key K) {
-	c.store.Delete(key)
+	c.mu.Lock()
+	delete(c.entries, key)
+	c.mu.Unlock()
 }
 
 // TTL returns the remaining time before key expires. A negative value means the
@@ -194,13 +205,23 @@ func (c *Cache[K, V]) TTL(key K) time.Duration {
 }
 
 // Range calls f for each key with its value and remaining TTL. Iteration stops
-// if f returns false. It follows sync.Map.Range semantics (no consistent
-// snapshot).
+// if f returns false. It iterates over a snapshot taken when Range is called,
+// so f may safely mutate the cache; mutations are not reflected in the
+// iteration.
 func (c *Cache[K, V]) Range(f func(key K, value V, ttl time.Duration) bool) {
-	c.store.Range(func(k, v any) bool {
-		it := v.(item[V])
-		return f(k.(K), it.value, c.expiry(it).Sub(c.clock()))
-	})
+	c.mu.RLock()
+	snapshot := make(map[K]item[V], len(c.entries))
+	for k, it := range c.entries {
+		snapshot[k] = it
+	}
+	c.mu.RUnlock()
+
+	now := c.clock()
+	for k, it := range snapshot {
+		if !f(k, it.value, c.expiry(it).Sub(now)) {
+			return
+		}
+	}
 }
 
 // fetchOnce runs fetch for key, collapsing concurrent calls for the same key
@@ -262,16 +283,40 @@ func (c *Cache[K, V]) triggerRefresh(key K, fetch Fetch[K, V]) {
 }
 
 func (c *Cache[K, V]) load(key K) (item[V], bool) {
-	v, ok := c.store.Load(key)
-	if !ok {
-		var zero item[V]
-		return zero, false
-	}
-	return v.(item[V]), true
+	c.mu.RLock()
+	it, ok := c.entries[key]
+	c.mu.RUnlock()
+	return it, ok
 }
 
 func (c *Cache[K, V]) put(key K, value V) {
-	c.store.Store(key, item[V]{value: value, fetchedAt: c.clock()})
+	now := c.clock()
+	c.mu.Lock()
+	c.entries[key] = item[V]{value: value, fetchedAt: now}
+	c.evictLocked()
+	c.mu.Unlock()
+}
+
+// evictLocked bounds the cache to Capacity, dropping dead entries first and
+// then arbitrary ones. Must hold c.mu.
+func (c *Cache[K, V]) evictLocked() {
+	if c.config.Capacity <= 0 || len(c.entries) <= c.config.Capacity {
+		return
+	}
+	for k, it := range c.entries {
+		if len(c.entries) <= c.config.Capacity {
+			return
+		}
+		if c.dead(it) {
+			delete(c.entries, k)
+		}
+	}
+	for k := range c.entries {
+		if len(c.entries) <= c.config.Capacity {
+			return
+		}
+		delete(c.entries, k)
+	}
 }
 
 func (c *Cache[K, V]) expiry(it item[V]) time.Time {

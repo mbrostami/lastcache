@@ -504,6 +504,58 @@ func TestGetAsync_SkipsRefreshIfAlreadyFresh(t *testing.T) {
 	}
 }
 
+// len reports the current number of entries (test helper).
+func cacheLen[K comparable, V any](c *Cache[K, V]) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.entries)
+}
+
+func TestCapacity_Bounded(t *testing.T) {
+	c := New[string, int](Config{TTL: time.Minute, Capacity: 3})
+	for i := 0; i < 10; i++ {
+		c.Set(string(rune('a'+i)), i)
+	}
+	if n := cacheLen(c); n != 3 {
+		t.Fatalf("len = %d, want 3", n)
+	}
+}
+
+// Dead entries (past the staleness cap) are evicted before live ones.
+func TestCapacity_EvictsDeadFirst(t *testing.T) {
+	now := fixedTime
+	c := New[string, int](Config{TTL: time.Second, StaleTTL: 10 * time.Second, Capacity: 2})
+	withClock(c, &now)
+
+	c.Set("dead", 1)
+	now = now.Add(time.Minute) // "dead" is now past TTL+StaleTTL
+	c.Set("live", 2)
+	c.Set("live2", 3) // over capacity: must evict "dead", not a live entry
+
+	if _, ok := c.load("dead"); ok {
+		t.Error("dead entry should have been evicted")
+	}
+	if _, ok := c.load("live"); !ok {
+		t.Error("live entry was evicted while a dead one existed")
+	}
+	if _, ok := c.load("live2"); !ok {
+		t.Error("just-inserted entry must survive eviction")
+	}
+	if n := cacheLen(c); n != 2 {
+		t.Fatalf("len = %d, want 2", n)
+	}
+}
+
+func TestCapacity_ZeroMeansUnbounded(t *testing.T) {
+	c := New[string, int](Config{TTL: time.Minute}) // Capacity unset
+	for i := 0; i < 100; i++ {
+		c.Set(string(rune(i)), i)
+	}
+	if n := cacheLen(c); n != 100 {
+		t.Fatalf("len = %d, want 100 (unbounded)", n)
+	}
+}
+
 func BenchmarkGet(b *testing.B) {
 	c := New[string, string](Config{TTL: time.Minute})
 	c.Set("key", "value")

@@ -15,7 +15,9 @@ go get github.com/mbrostami/lastcache/v2
 
 ### stale-if-error (`Get` / `GetStale`)
 When a fetch fails and a previous value is still around, the cache serves that
-stale value for up to `Config.StaleTTL` instead of returning the error.
+stale value instead of returning the error — for at most `Config.StaleTTL`
+past expiry. The cap is a hard wall-clock bound anchored at the last
+*successful* fetch: failed refreshes never extend it.
 
 ### stale-while-revalidate (`GetAsync`)
 An expired value is returned immediately while a single background goroutine
@@ -88,8 +90,9 @@ type Result[V any] struct {
 | Field | Meaning |
 |-------|---------|
 | `TTL` | How long a fetched value stays fresh. Defaults to 1 minute. |
-| `StaleTTL` | How long a stale value may be served after expiry when a refresh fails. `0` disables serving stale. |
+| `StaleTTL` | How long a stale value may be served after expiry when a refresh fails. A hard cap anchored at the last successful fetch; past it the value is treated as gone. `0` disables serving stale on error. |
 | `MaxConcurrentRefresh` | Caps concurrent background refreshes (`GetAsync`) across all keys. Defaults to `1`. |
+| `Capacity` | Bounds the number of entries; dead entries are evicted first, then arbitrary ones. `<= 0` means unbounded. Set it whenever keys come from user input. |
 | `OnError` | Optional `func(key any, err error)` called when a background refresh fails. |
 | `Context` | Base context for background refreshes (they outlive the request). Defaults to `context.Background()`. |
 
