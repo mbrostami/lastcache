@@ -11,6 +11,12 @@
 //	stale-while-revalidate (GetAsync)
 //	An expired value is returned immediately while a single background goroutine
 //	refreshes it.
+//
+//	negative caching (Config.NotFound + Config.NegativeTTL)
+//	An error the NotFound classifier reports as an authoritative "does not
+//	exist" evicts any cached value (it is never served stale) and is itself
+//	cached for NegativeTTL, so lookups of a hammered missing key are answered
+//	from cache instead of hitting the upstream.
 package lastcache
 
 import (
@@ -52,8 +58,23 @@ type Config struct {
 	// grow without limit.
 	Capacity int
 
+	// NotFound reports whether a fetch error means the key authoritatively
+	// does not exist, rather than a transient upstream failure. Authoritative
+	// misses evict any cached value — they are never served stale — and are
+	// negatively cached for NegativeTTL. Nil treats every error as transient.
+	NotFound func(err error) bool
+
+	// NegativeTTL is how long an authoritative miss (per NotFound) is served
+	// from cache before the next lookup re-fetches. Keep it short: a negative
+	// entry makes a key that was just created upstream look missing until it
+	// expires. 0 disables negative caching; authoritative misses then still
+	// evict, but every lookup re-fetches.
+	NegativeTTL time.Duration
+
 	// OnError, if set, is called with the underlying error when a background
-	// refresh (GetAsync) fails. Foreground errors are returned to the caller.
+	// refresh (GetAsync) fails transiently. Foreground errors are returned to
+	// the caller, and authoritative misses (per NotFound) are cache state, not
+	// errors, so they are not reported.
 	OnError func(key any, err error)
 
 	// Context is the base context used for background refreshes, which outlive
@@ -76,9 +97,12 @@ type Result[V any] struct {
 	Err error
 }
 
+// item is either a value (err == nil) or a negative entry caching an
+// authoritative "not found" (err != nil, value is the zero value).
 type item[V any] struct {
 	value     V
-	fetchedAt time.Time // when the value was last fetched successfully (or Set)
+	err       error
+	fetchedAt time.Time // when the entry was last fetched (or Set)
 }
 
 type call[V any] struct {
@@ -135,9 +159,13 @@ func (c *Cache[K, V]) Get(ctx context.Context, key K, fetch Fetch[K, V]) (V, err
 }
 
 // GetStale is like Get but reports whether the value was served stale via the
-// returned Result. The error is non-nil only when nothing could be served.
+// returned Result. The error is non-nil only when nothing could be served; a
+// fresh negative entry counts as such and returns the cached error.
 func (c *Cache[K, V]) GetStale(ctx context.Context, key K, fetch Fetch[K, V]) (Result[V], error) {
 	if it, ok := c.load(key); ok && !c.expired(it) {
+		if it.err != nil {
+			return Result[V]{Err: it.err}, it.err
+		}
 		return Result[V]{Value: it.value}, nil
 	}
 
@@ -146,11 +174,13 @@ func (c *Cache[K, V]) GetStale(ctx context.Context, key K, fetch Fetch[K, V]) (R
 		return Result[V]{Value: val}, nil
 	}
 
-	// Fetch failed: serve the last known value while it is within the hard
-	// staleness cap. The item is left untouched, so the cap never moves and a
-	// concurrent successful refresh is never overwritten with a stale copy.
+	// Transient failure: serve the last known value while it is within the
+	// hard staleness cap. The item is left untouched, so the cap never moves
+	// and a concurrent successful refresh is never overwritten with a stale
+	// copy. Authoritative misses never serve stale (fetchOnce already evicted
+	// the value, so the load below misses or finds a negative entry).
 	if c.config.StaleTTL > 0 {
-		if it, ok := c.load(key); ok && !c.dead(it) {
+		if it, ok := c.load(key); ok && it.err == nil && !c.dead(it) {
 			return Result[V]{Value: it.value, Stale: true, Err: err}, nil
 		}
 	}
@@ -163,13 +193,20 @@ func (c *Cache[K, V]) GetStale(ctx context.Context, key K, fetch Fetch[K, V]) (R
 // value is returned (Result.Stale == true) and a single background goroutine
 // refreshes the key. On a cold miss — or once a value is past the hard
 // staleness cap — the fetch runs synchronously; if it fails, Result.Err is
-// set. Background refresh errors are reported via Config.OnError.
+// set. A fresh negative entry returns its cached error without fetching.
+// Background refresh errors are reported via Config.OnError.
 func (c *Cache[K, V]) GetAsync(ctx context.Context, key K, fetch Fetch[K, V]) Result[V] {
 	it, ok := c.load(key)
-	if !ok || c.dead(it) {
+	if ok && it.err != nil && !c.expired(it) {
+		return Result[V]{Err: it.err}
+	}
+
+	if !ok || it.err != nil || c.dead(it) {
 		val, err := c.fetchOnce(ctx, key, fetch)
 		if err != nil {
-			c.onError(key, err)
+			if !c.isNotFound(err) {
+				c.onError(key, err)
+			}
 			return Result[V]{Err: err}
 		}
 		return Result[V]{Value: val}
@@ -204,10 +241,10 @@ func (c *Cache[K, V]) TTL(key K) time.Duration {
 	return 0
 }
 
-// Range calls f for each key with its value and remaining TTL. Iteration stops
-// if f returns false. It iterates over a snapshot taken when Range is called,
-// so f may safely mutate the cache; mutations are not reflected in the
-// iteration.
+// Range calls f for each key with its value and remaining TTL. Negative
+// entries hold no value and are skipped. Iteration stops if f returns false.
+// It iterates over a snapshot taken when Range is called, so f may safely
+// mutate the cache; mutations are not reflected in the iteration.
 func (c *Cache[K, V]) Range(f func(key K, value V, ttl time.Duration) bool) {
 	c.mu.RLock()
 	snapshot := make(map[K]item[V], len(c.entries))
@@ -218,6 +255,9 @@ func (c *Cache[K, V]) Range(f func(key K, value V, ttl time.Duration) bool) {
 
 	now := c.clock()
 	for k, it := range snapshot {
+		if it.err != nil {
+			continue
+		}
 		if !f(k, it.value, c.expiry(it).Sub(now)) {
 			return
 		}
@@ -238,9 +278,7 @@ func (c *Cache[K, V]) fetchOnce(ctx context.Context, key K, fetch Fetch[K, V]) (
 	} else {
 		go func() {
 			cl.val, cl.err = fetch(context.WithoutCancel(ctx), key)
-			if cl.err == nil {
-				c.Set(key, cl.val)
-			}
+			c.storeResult(key, cl.val, cl.err)
 			c.inflight.Delete(key)
 			close(cl.done)
 		}()
@@ -274,11 +312,10 @@ func (c *Cache[K, V]) triggerRefresh(key K, fetch Fetch[K, V]) {
 		}
 
 		val, err := fetch(c.baseCtx, key)
-		if err != nil {
+		c.storeResult(key, val, err)
+		if err != nil && !c.isNotFound(err) {
 			c.onError(key, err)
-			return
 		}
-		c.Set(key, val)
 	}()
 }
 
@@ -295,6 +332,31 @@ func (c *Cache[K, V]) put(key K, value V) {
 	c.entries[key] = item[V]{value: value, fetchedAt: now}
 	c.evictLocked()
 	c.mu.Unlock()
+}
+
+// storeResult records a fetch outcome: a success stores the value, an
+// authoritative miss evicts any cached value and (with NegativeTTL > 0) caches
+// the error, and a transient failure leaves the cache untouched so any stale
+// value keeps being served up to its cap.
+func (c *Cache[K, V]) storeResult(key K, val V, err error) {
+	switch {
+	case err == nil:
+		c.put(key, val)
+	case c.isNotFound(err):
+		now := c.clock()
+		c.mu.Lock()
+		if c.config.NegativeTTL > 0 {
+			c.entries[key] = item[V]{err: err, fetchedAt: now}
+			c.evictLocked()
+		} else {
+			delete(c.entries, key)
+		}
+		c.mu.Unlock()
+	}
+}
+
+func (c *Cache[K, V]) isNotFound(err error) bool {
+	return c.config.NotFound != nil && c.config.NotFound(err)
 }
 
 // evictLocked bounds the cache to Capacity, dropping dead entries first and
@@ -320,6 +382,9 @@ func (c *Cache[K, V]) evictLocked() {
 }
 
 func (c *Cache[K, V]) expiry(it item[V]) time.Time {
+	if it.err != nil {
+		return it.fetchedAt.Add(c.config.NegativeTTL)
+	}
 	return it.fetchedAt.Add(c.config.TTL)
 }
 
@@ -327,10 +392,14 @@ func (c *Cache[K, V]) expired(it item[V]) bool {
 	return c.clock().After(c.expiry(it))
 }
 
-// dead reports whether it is past the hard staleness cap and may no longer be
-// served, even stale. With StaleTTL == 0 nothing is ever dead: Get already
-// refuses to serve stale, and GetAsync's staleness is deliberately unbounded.
+// dead reports whether it may no longer be served at all. A negative entry
+// dies at expiry (misses are never served stale). A value dies past the hard
+// staleness cap; with StaleTTL == 0 values are never dead: Get already refuses
+// to serve stale, and GetAsync's staleness is deliberately unbounded.
 func (c *Cache[K, V]) dead(it item[V]) bool {
+	if it.err != nil {
+		return c.expired(it)
+	}
 	return c.config.StaleTTL > 0 && c.clock().After(c.expiry(it).Add(c.config.StaleTTL))
 }
 

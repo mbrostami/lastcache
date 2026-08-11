@@ -23,6 +23,14 @@ past expiry. The cap is a hard wall-clock bound anchored at the last
 An expired value is returned immediately while a single background goroutine
 refreshes it.
 
+### negative caching (`NotFound` + `NegativeTTL`)
+An error your `NotFound` classifier reports as an authoritative "does not
+exist" evicts any cached value — a deleted key is never served stale — and is
+itself cached for `NegativeTTL`, so a hammered missing key is answered from
+cache instead of hitting the upstream. Keep `NegativeTTL` short: a negative
+entry makes a key that was just created upstream look missing until it
+expires.
+
 ## Usage
 
 ```go
@@ -93,6 +101,8 @@ type Result[V any] struct {
 | `StaleTTL` | How long a stale value may be served after expiry when a refresh fails. A hard cap anchored at the last successful fetch; past it the value is treated as gone. `0` disables serving stale on error. |
 | `MaxConcurrentRefresh` | Caps concurrent background refreshes (`GetAsync`) across all keys. Defaults to `1`. |
 | `Capacity` | Bounds the number of entries; dead entries are evicted first, then arbitrary ones. `<= 0` means unbounded. Set it whenever keys come from user input. |
+| `NotFound` | Optional `func(err error) bool` classifying a fetch error as an authoritative "does not exist". Such misses evict any cached value and are negatively cached. Nil treats every error as transient. |
+| `NegativeTTL` | How long an authoritative miss is served from cache before re-fetching. `0` disables negative caching (misses still evict). |
 | `OnError` | Optional `func(key any, err error)` called when a background refresh fails. |
 | `Context` | Base context for background refreshes (they outlive the request). Defaults to `context.Background()`. |
 

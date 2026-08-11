@@ -504,6 +504,149 @@ func TestGetAsync_SkipsRefreshIfAlreadyFresh(t *testing.T) {
 	}
 }
 
+var errNotFound = errors.New("not found")
+
+func notFoundConfig(negTTL time.Duration) Config {
+	return Config{
+		TTL:         time.Second,
+		StaleTTL:    time.Minute,
+		NegativeTTL: negTTL,
+		NotFound:    func(err error) bool { return errors.Is(err, errNotFound) },
+	}
+}
+
+// An authoritative miss is cached: repeat lookups within NegativeTTL are
+// answered from cache, and after expiry the next lookup re-fetches.
+func TestNegative_CachedAndExpires(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](notFoundConfig(5 * time.Second))
+	withClock(c, &now)
+
+	var calls int32
+	exists := false
+	fetch := func(context.Context, string) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		if exists {
+			return "v", nil
+		}
+		return "", errNotFound
+	}
+
+	for i := 0; i < 3; i++ { // one fetch, then served from the negative entry
+		if _, err := c.Get(context.Background(), "k", fetch); !errors.Is(err, errNotFound) {
+			t.Fatalf("want errNotFound, got %v", err)
+		}
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("fetch ran %d times, want 1 (negative hit)", n)
+	}
+
+	// Past NegativeTTL the miss is re-fetched and the new value found.
+	exists = true
+	now = now.Add(6 * time.Second)
+	if v, err := c.Get(context.Background(), "k", fetch); err != nil || v != "v" {
+		t.Fatalf("after negative expiry: got (%v,%v), want (v,nil)", v, err)
+	}
+}
+
+// An authoritative miss evicts a cached value: despite StaleTTL, the stale
+// value must not be served once the upstream said the key is gone.
+func TestNegative_AuthoritativeMissEvictsValue(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](notFoundConfig(5 * time.Second))
+	withClock(c, &now)
+	c.Set("k", "stored")
+	now = now.Add(2 * time.Second) // expired, well within the stale cap
+
+	var calls int32
+	fetch := func(context.Context, string) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		return "", errNotFound
+	}
+
+	res, err := c.GetStale(context.Background(), "k", fetch)
+	if !errors.Is(err, errNotFound) || res.Stale {
+		t.Fatalf("authoritative miss must not serve stale, got (%+v,%v)", res, err)
+	}
+	// Evicted and negatively cached: answered without another fetch.
+	if _, err := c.Get(context.Background(), "k", fetch); !errors.Is(err, errNotFound) {
+		t.Fatalf("want errNotFound, got %v", err)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("fetch ran %d times, want 1", n)
+	}
+}
+
+// With NegativeTTL = 0 an authoritative miss still evicts the value but is not
+// cached: every lookup re-fetches.
+func TestNegative_DisabledStillEvicts(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](notFoundConfig(0))
+	withClock(c, &now)
+	c.Set("k", "stored")
+	now = now.Add(2 * time.Second)
+
+	var calls int32
+	fetch := func(context.Context, string) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		return "", errNotFound
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := c.Get(context.Background(), "k", fetch); !errors.Is(err, errNotFound) {
+			t.Fatalf("want errNotFound, got %v", err)
+		}
+	}
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Fatalf("fetch ran %d times, want 2 (no negative caching)", n)
+	}
+	if _, ok := c.load("k"); ok {
+		t.Fatal("value must be evicted on authoritative miss")
+	}
+}
+
+// A background refresh that comes back "not found" evicts the value, stores a
+// negative entry, and does not fire OnError.
+func TestGetAsync_BackgroundNotFound(t *testing.T) {
+	now := fixedTime
+	var onErrCalls int32
+	cfg := notFoundConfig(5 * time.Second)
+	cfg.OnError = func(any, error) { atomic.AddInt32(&onErrCalls, 1) }
+	c := New[string, string](cfg)
+	withClock(c, &now)
+	c.Set("k", "stored")
+	now = now.Add(2 * time.Second) // expired (no clock writes after this)
+
+	res := c.GetAsync(context.Background(), "k", func(context.Context, string) (string, error) {
+		return "", errNotFound
+	})
+	if res.Value != "stored" || !res.Stale {
+		t.Fatalf("got %+v, want stale 'stored' while the refresh runs", res)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		if it, ok := c.load("k"); ok && it.err != nil {
+			break // negative entry landed
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background refresh did not store a negative entry")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	var calls int32
+	res = c.GetAsync(context.Background(), "k", func(context.Context, string) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		return "x", nil
+	})
+	if !errors.Is(res.Err, errNotFound) || atomic.LoadInt32(&calls) != 0 {
+		t.Fatalf("want cached errNotFound with no fetch, got (%+v, %d calls)", res, calls)
+	}
+	if n := atomic.LoadInt32(&onErrCalls); n != 0 {
+		t.Fatalf("OnError fired %d times for an authoritative miss, want 0", n)
+	}
+}
+
 // len reports the current number of entries (test helper).
 func cacheLen[K comparable, V any](c *Cache[K, V]) int {
 	c.mu.RLock()
