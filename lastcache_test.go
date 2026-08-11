@@ -112,6 +112,52 @@ func TestGetStale_NoStaleTTL_ReturnsError(t *testing.T) {
 	}
 }
 
+// The staleness cap is a hard wall-clock bound from the last successful fetch:
+// repeated failed refreshes do not extend it, and past it the error is
+// returned instead of the stale value.
+func TestGetStale_HardCap(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Second, StaleTTL: 10 * time.Second})
+	withClock(c, &now)
+	c.Set("k", "stored")
+	failing := func(context.Context, string) (string, error) {
+		return "", errors.New("upstream down")
+	}
+
+	// Expired but within the cap: served stale, repeatedly.
+	now = now.Add(5 * time.Second)
+	for i := 0; i < 3; i++ {
+		res, err := c.GetStale(context.Background(), "k", failing)
+		if err != nil || res.Value != "stored" || !res.Stale {
+			t.Fatalf("within cap: got (%+v,%v), want stale 'stored'", res, err)
+		}
+	}
+
+	// Past fetchedAt+TTL+StaleTTL: the failed refreshes above must not have
+	// pushed the cap out.
+	now = fixedTime.Add(12 * time.Second)
+	if _, err := c.GetStale(context.Background(), "k", failing); err == nil {
+		t.Fatal("past the hard cap a failing fetch must return the error")
+	}
+}
+
+// GetAsync stops serving a value past the hard cap and falls back to a
+// synchronous fetch, like a cold miss.
+func TestGetAsync_HardCap(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Second, StaleTTL: 10 * time.Second})
+	withClock(c, &now)
+	c.Set("k", "stored")
+
+	now = now.Add(12 * time.Second) // past the cap
+	res := c.GetAsync(context.Background(), "k", func(context.Context, string) (string, error) {
+		return "new", nil
+	})
+	if res.Value != "new" || res.Stale || res.Err != nil {
+		t.Fatalf("got %+v, want fresh 'new' fetched synchronously", res)
+	}
+}
+
 // The core fix: concurrent requests for the same expired key share one fetch.
 func TestGet_SingleFlight(t *testing.T) {
 	now := fixedTime
