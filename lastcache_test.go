@@ -112,6 +112,52 @@ func TestGetStale_NoStaleTTL_ReturnsError(t *testing.T) {
 	}
 }
 
+// The staleness cap is a hard wall-clock bound from the last successful fetch:
+// repeated failed refreshes do not extend it, and past it the error is
+// returned instead of the stale value.
+func TestGetStale_HardCap(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Second, StaleTTL: 10 * time.Second})
+	withClock(c, &now)
+	c.Set("k", "stored")
+	failing := func(context.Context, string) (string, error) {
+		return "", errors.New("upstream down")
+	}
+
+	// Expired but within the cap: served stale, repeatedly.
+	now = now.Add(5 * time.Second)
+	for i := 0; i < 3; i++ {
+		res, err := c.GetStale(context.Background(), "k", failing)
+		if err != nil || res.Value != "stored" || !res.Stale {
+			t.Fatalf("within cap: got (%+v,%v), want stale 'stored'", res, err)
+		}
+	}
+
+	// Past fetchedAt+TTL+StaleTTL: the failed refreshes above must not have
+	// pushed the cap out.
+	now = fixedTime.Add(12 * time.Second)
+	if _, err := c.GetStale(context.Background(), "k", failing); err == nil {
+		t.Fatal("past the hard cap a failing fetch must return the error")
+	}
+}
+
+// GetAsync stops serving a value past the hard cap and falls back to a
+// synchronous fetch, like a cold miss.
+func TestGetAsync_HardCap(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](Config{TTL: time.Second, StaleTTL: 10 * time.Second})
+	withClock(c, &now)
+	c.Set("k", "stored")
+
+	now = now.Add(12 * time.Second) // past the cap
+	res := c.GetAsync(context.Background(), "k", func(context.Context, string) (string, error) {
+		return "new", nil
+	})
+	if res.Value != "new" || res.Stale || res.Err != nil {
+		t.Fatalf("got %+v, want fresh 'new' fetched synchronously", res)
+	}
+}
+
 // The core fix: concurrent requests for the same expired key share one fetch.
 func TestGet_SingleFlight(t *testing.T) {
 	now := fixedTime
@@ -136,6 +182,87 @@ func TestGet_SingleFlight(t *testing.T) {
 	wg.Wait()
 	if n := atomic.LoadInt64(&calls); n != 1 {
 		t.Fatalf("single-flight failed: fetch ran %d times, want 1", n)
+	}
+}
+
+// A waiter whose context is canceled gets ctx.Err() immediately instead of
+// blocking until the shared fetch finishes.
+func TestGet_WaiterHonorsOwnContext(t *testing.T) {
+	c := New[string, string](Config{TTL: time.Minute})
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+	fetch := func(context.Context, string) (string, error) {
+		close(started)
+		<-release
+		return "v", nil
+	}
+
+	// Initiate the shared fetch and keep it blocked.
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		if v, err := c.Get(context.Background(), "k", fetch); err != nil || v != "v" {
+			t.Errorf("initiator got (%v,%v), want (v,nil)", v, err)
+		}
+	}()
+	<-started
+
+	// A second caller joins the in-flight fetch but cancels while waiting.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.Get(ctx, "k", fetch); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter got %v, want context.Canceled", err)
+	}
+
+	close(release)
+	<-leaderDone
+}
+
+// Canceling the context of the caller that initiated the shared fetch must not
+// poison the result for the other callers: the fetch runs on a cancel-free
+// context and its result is still cached.
+func TestGet_InitiatorCancelDoesNotAbortSharedFetch(t *testing.T) {
+	c := New[string, string](Config{TTL: time.Minute})
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+	fetch := func(ctx context.Context, _ string) (string, error) {
+		close(started)
+		<-release
+		// The fetch context must outlive the initiator's cancellation.
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		return "v", nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	initiatorDone := make(chan struct{})
+	go func() {
+		defer close(initiatorDone)
+		if _, err := c.Get(ctx, "k", fetch); !errors.Is(err, context.Canceled) {
+			t.Errorf("initiator got %v, want context.Canceled", err)
+		}
+	}()
+	<-started
+
+	// A second caller joins, then the initiator gives up.
+	waiterDone := make(chan struct{})
+	go func() {
+		defer close(waiterDone)
+		if v, err := c.Get(context.Background(), "k", fetch); err != nil || v != "v" {
+			t.Errorf("waiter got (%v,%v), want (v,nil)", v, err)
+		}
+	}()
+	cancel()
+	<-initiatorDone
+
+	close(release)
+	<-waiterDone
+
+	if v, ok := c.load("k"); !ok || v.value != "v" {
+		t.Fatalf("fetch result was not cached, got (%v,%v)", v.value, ok)
 	}
 }
 
@@ -374,6 +501,201 @@ func TestGetAsync_SkipsRefreshIfAlreadyFresh(t *testing.T) {
 	}
 	if v, _ := c.load("k"); v.value != "fresh-direct" {
 		t.Fatalf("k value = %q, want fresh-direct (stale refresh must not overwrite)", v.value)
+	}
+}
+
+var errNotFound = errors.New("not found")
+
+func notFoundConfig(negTTL time.Duration) Config {
+	return Config{
+		TTL:         time.Second,
+		StaleTTL:    time.Minute,
+		NegativeTTL: negTTL,
+		NotFound:    func(err error) bool { return errors.Is(err, errNotFound) },
+	}
+}
+
+// An authoritative miss is cached: repeat lookups within NegativeTTL are
+// answered from cache, and after expiry the next lookup re-fetches.
+func TestNegative_CachedAndExpires(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](notFoundConfig(5 * time.Second))
+	withClock(c, &now)
+
+	var calls int32
+	exists := false
+	fetch := func(context.Context, string) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		if exists {
+			return "v", nil
+		}
+		return "", errNotFound
+	}
+
+	for i := 0; i < 3; i++ { // one fetch, then served from the negative entry
+		if _, err := c.Get(context.Background(), "k", fetch); !errors.Is(err, errNotFound) {
+			t.Fatalf("want errNotFound, got %v", err)
+		}
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("fetch ran %d times, want 1 (negative hit)", n)
+	}
+
+	// Past NegativeTTL the miss is re-fetched and the new value found.
+	exists = true
+	now = now.Add(6 * time.Second)
+	if v, err := c.Get(context.Background(), "k", fetch); err != nil || v != "v" {
+		t.Fatalf("after negative expiry: got (%v,%v), want (v,nil)", v, err)
+	}
+}
+
+// An authoritative miss evicts a cached value: despite StaleTTL, the stale
+// value must not be served once the upstream said the key is gone.
+func TestNegative_AuthoritativeMissEvictsValue(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](notFoundConfig(5 * time.Second))
+	withClock(c, &now)
+	c.Set("k", "stored")
+	now = now.Add(2 * time.Second) // expired, well within the stale cap
+
+	var calls int32
+	fetch := func(context.Context, string) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		return "", errNotFound
+	}
+
+	res, err := c.GetStale(context.Background(), "k", fetch)
+	if !errors.Is(err, errNotFound) || res.Stale {
+		t.Fatalf("authoritative miss must not serve stale, got (%+v,%v)", res, err)
+	}
+	// Evicted and negatively cached: answered without another fetch.
+	if _, err := c.Get(context.Background(), "k", fetch); !errors.Is(err, errNotFound) {
+		t.Fatalf("want errNotFound, got %v", err)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("fetch ran %d times, want 1", n)
+	}
+}
+
+// With NegativeTTL = 0 an authoritative miss still evicts the value but is not
+// cached: every lookup re-fetches.
+func TestNegative_DisabledStillEvicts(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](notFoundConfig(0))
+	withClock(c, &now)
+	c.Set("k", "stored")
+	now = now.Add(2 * time.Second)
+
+	var calls int32
+	fetch := func(context.Context, string) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		return "", errNotFound
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := c.Get(context.Background(), "k", fetch); !errors.Is(err, errNotFound) {
+			t.Fatalf("want errNotFound, got %v", err)
+		}
+	}
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Fatalf("fetch ran %d times, want 2 (no negative caching)", n)
+	}
+	if _, ok := c.load("k"); ok {
+		t.Fatal("value must be evicted on authoritative miss")
+	}
+}
+
+// A background refresh that comes back "not found" evicts the value, stores a
+// negative entry, and does not fire OnError.
+func TestGetAsync_BackgroundNotFound(t *testing.T) {
+	now := fixedTime
+	var onErrCalls int32
+	cfg := notFoundConfig(5 * time.Second)
+	cfg.OnError = func(any, error) { atomic.AddInt32(&onErrCalls, 1) }
+	c := New[string, string](cfg)
+	withClock(c, &now)
+	c.Set("k", "stored")
+	now = now.Add(2 * time.Second) // expired (no clock writes after this)
+
+	res := c.GetAsync(context.Background(), "k", func(context.Context, string) (string, error) {
+		return "", errNotFound
+	})
+	if res.Value != "stored" || !res.Stale {
+		t.Fatalf("got %+v, want stale 'stored' while the refresh runs", res)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		if it, ok := c.load("k"); ok && it.err != nil {
+			break // negative entry landed
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background refresh did not store a negative entry")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	var calls int32
+	res = c.GetAsync(context.Background(), "k", func(context.Context, string) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		return "x", nil
+	})
+	if !errors.Is(res.Err, errNotFound) || atomic.LoadInt32(&calls) != 0 {
+		t.Fatalf("want cached errNotFound with no fetch, got (%+v, %d calls)", res, calls)
+	}
+	if n := atomic.LoadInt32(&onErrCalls); n != 0 {
+		t.Fatalf("OnError fired %d times for an authoritative miss, want 0", n)
+	}
+}
+
+// len reports the current number of entries (test helper).
+func cacheLen[K comparable, V any](c *Cache[K, V]) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.entries)
+}
+
+func TestCapacity_Bounded(t *testing.T) {
+	c := New[string, int](Config{TTL: time.Minute, Capacity: 3})
+	for i := 0; i < 10; i++ {
+		c.Set(string(rune('a'+i)), i)
+	}
+	if n := cacheLen(c); n != 3 {
+		t.Fatalf("len = %d, want 3", n)
+	}
+}
+
+// Dead entries (past the staleness cap) are evicted before live ones.
+func TestCapacity_EvictsDeadFirst(t *testing.T) {
+	now := fixedTime
+	c := New[string, int](Config{TTL: time.Second, StaleTTL: 10 * time.Second, Capacity: 2})
+	withClock(c, &now)
+
+	c.Set("dead", 1)
+	now = now.Add(time.Minute) // "dead" is now past TTL+StaleTTL
+	c.Set("live", 2)
+	c.Set("live2", 3) // over capacity: must evict "dead", not a live entry
+
+	if _, ok := c.load("dead"); ok {
+		t.Error("dead entry should have been evicted")
+	}
+	if _, ok := c.load("live"); !ok {
+		t.Error("live entry was evicted while a dead one existed")
+	}
+	if _, ok := c.load("live2"); !ok {
+		t.Error("just-inserted entry must survive eviction")
+	}
+	if n := cacheLen(c); n != 2 {
+		t.Fatalf("len = %d, want 2", n)
+	}
+}
+
+func TestCapacity_ZeroMeansUnbounded(t *testing.T) {
+	c := New[string, int](Config{TTL: time.Minute}) // Capacity unset
+	for i := 0; i < 100; i++ {
+		c.Set(string(rune(i)), i)
+	}
+	if n := cacheLen(c); n != 100 {
+		t.Fatalf("len = %d, want 100 (unbounded)", n)
 	}
 }
 
