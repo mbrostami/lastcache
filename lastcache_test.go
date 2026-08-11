@@ -139,6 +139,87 @@ func TestGet_SingleFlight(t *testing.T) {
 	}
 }
 
+// A waiter whose context is canceled gets ctx.Err() immediately instead of
+// blocking until the shared fetch finishes.
+func TestGet_WaiterHonorsOwnContext(t *testing.T) {
+	c := New[string, string](Config{TTL: time.Minute})
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+	fetch := func(context.Context, string) (string, error) {
+		close(started)
+		<-release
+		return "v", nil
+	}
+
+	// Initiate the shared fetch and keep it blocked.
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		if v, err := c.Get(context.Background(), "k", fetch); err != nil || v != "v" {
+			t.Errorf("initiator got (%v,%v), want (v,nil)", v, err)
+		}
+	}()
+	<-started
+
+	// A second caller joins the in-flight fetch but cancels while waiting.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.Get(ctx, "k", fetch); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter got %v, want context.Canceled", err)
+	}
+
+	close(release)
+	<-leaderDone
+}
+
+// Canceling the context of the caller that initiated the shared fetch must not
+// poison the result for the other callers: the fetch runs on a cancel-free
+// context and its result is still cached.
+func TestGet_InitiatorCancelDoesNotAbortSharedFetch(t *testing.T) {
+	c := New[string, string](Config{TTL: time.Minute})
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+	fetch := func(ctx context.Context, _ string) (string, error) {
+		close(started)
+		<-release
+		// The fetch context must outlive the initiator's cancellation.
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		return "v", nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	initiatorDone := make(chan struct{})
+	go func() {
+		defer close(initiatorDone)
+		if _, err := c.Get(ctx, "k", fetch); !errors.Is(err, context.Canceled) {
+			t.Errorf("initiator got %v, want context.Canceled", err)
+		}
+	}()
+	<-started
+
+	// A second caller joins, then the initiator gives up.
+	waiterDone := make(chan struct{})
+	go func() {
+		defer close(waiterDone)
+		if v, err := c.Get(context.Background(), "k", fetch); err != nil || v != "v" {
+			t.Errorf("waiter got (%v,%v), want (v,nil)", v, err)
+		}
+	}()
+	cancel()
+	<-initiatorDone
+
+	close(release)
+	<-waiterDone
+
+	if v, ok := c.load("k"); !ok || v.value != "v" {
+		t.Fatalf("fetch result was not cached, got (%v,%v)", v.value, ok)
+	}
+}
+
 func TestGetAsync_ColdMiss_Sync(t *testing.T) {
 	c := New[string, string](Config{TTL: time.Minute})
 	res := c.GetAsync(context.Background(), "k", func(context.Context, string) (string, error) {

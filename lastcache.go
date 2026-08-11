@@ -67,9 +67,9 @@ type item[V any] struct {
 }
 
 type call[V any] struct {
-	wg  sync.WaitGroup
-	val V
-	err error
+	done chan struct{}
+	val  V
+	err  error
 }
 
 // Cache is a generic, concurrency-safe cache. Use New to construct one; it must
@@ -196,23 +196,33 @@ func (c *Cache[K, V]) Range(f func(key K, value V, ttl time.Duration) bool) {
 
 // fetchOnce runs fetch for key, collapsing concurrent calls for the same key
 // into a single fetch and caching a successful result.
+//
+// The shared fetch runs on a cancel-free copy of the initiating caller's
+// context, so one caller giving up does not abort the fetch for the others.
+// Each caller (the initiator included) waits with its own context and returns
+// ctx.Err() if that is done first; the fetch still completes and is cached.
 func (c *Cache[K, V]) fetchOnce(ctx context.Context, key K, fetch Fetch[K, V]) (V, error) {
-	cl := &call[V]{}
-	cl.wg.Add(1)
-	actual, loaded := c.inflight.LoadOrStore(key, cl)
-	if loaded {
-		existing := actual.(*call[V])
-		existing.wg.Wait()
-		return existing.val, existing.err
+	cl := &call[V]{done: make(chan struct{})}
+	if actual, loaded := c.inflight.LoadOrStore(key, cl); loaded {
+		cl = actual.(*call[V])
+	} else {
+		go func() {
+			cl.val, cl.err = fetch(context.WithoutCancel(ctx), key)
+			if cl.err == nil {
+				c.Set(key, cl.val)
+			}
+			c.inflight.Delete(key)
+			close(cl.done)
+		}()
 	}
 
-	cl.val, cl.err = fetch(ctx, key)
-	if cl.err == nil {
-		c.Set(key, cl.val)
+	select {
+	case <-cl.done:
+		return cl.val, cl.err
+	case <-ctx.Done():
+		var zero V
+		return zero, ctx.Err()
 	}
-	c.inflight.Delete(key)
-	cl.wg.Done()
-	return cl.val, cl.err
 }
 
 // triggerRefresh starts at most one background refresh per key, bounded across
