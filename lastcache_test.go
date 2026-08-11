@@ -34,6 +34,40 @@ func TestNew_Defaults(t *testing.T) {
 	}
 }
 
+// Config.Clock lets tests control expiry without sleeping or touching
+// internals.
+func TestConfig_Clock(t *testing.T) {
+	var mu sync.Mutex
+	now := fixedTime
+	c := New[string, string](Config{
+		TTL: time.Minute,
+		Clock: func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		},
+	})
+	c.Set("k", "v")
+
+	var calls int32
+	fetch := func(context.Context, string) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		return "v2", nil
+	}
+
+	if v, _ := c.Get(context.Background(), "k", fetch); v != "v" || atomic.LoadInt32(&calls) != 0 {
+		t.Fatalf("fresh hit: got %q with %d fetches, want \"v\" with 0", v, atomic.LoadInt32(&calls))
+	}
+
+	mu.Lock()
+	now = now.Add(2 * time.Minute) // expire
+	mu.Unlock()
+
+	if v, _ := c.Get(context.Background(), "k", fetch); v != "v2" || atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("after expiry: got %q with %d fetches, want \"v2\" with 1", v, atomic.LoadInt32(&calls))
+	}
+}
+
 func TestGet_FreshHit_NoFetch(t *testing.T) {
 	now := fixedTime
 	c := New[string, int](Config{TTL: time.Minute})

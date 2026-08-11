@@ -80,6 +80,12 @@ type Config struct {
 	// Context is the base context used for background refreshes, which outlive
 	// the request that triggered them. Defaults to context.Background().
 	Context context.Context
+
+	// Clock returns the current time and defaults to time.Now. Override it in
+	// tests to control TTL expiry deterministically instead of sleeping. The
+	// cache reads it from background goroutines too, so a test clock must be
+	// safe for concurrent use.
+	Clock func() time.Time
 }
 
 // Result carries a value plus whether it was served stale.
@@ -140,9 +146,14 @@ func New[K comparable, V any](config Config) *Cache[K, V] {
 		base = context.Background()
 	}
 
+	clock := config.Clock
+	if clock == nil {
+		clock = time.Now
+	}
+
 	return &Cache[K, V]{
 		config:    config,
-		clock:     time.Now,
+		clock:     clock,
 		baseCtx:   base,
 		entries:   make(map[K]item[V]),
 		semaphore: make(chan struct{}, sem),
