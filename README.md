@@ -105,6 +105,7 @@ type Result[V any] struct {
 | `NegativeTTL` | How long an authoritative miss is served from cache before re-fetching. `0` disables negative caching (misses still evict). |
 | `OnError` | Optional `func(key any, err error)` called when a background refresh fails. |
 | `Context` | Base context for background refreshes (they outlive the request). Defaults to `context.Background()`. |
+| `Clock` | Optional `func() time.Time` used for all expiry checks. Defaults to `time.Now`. Override in tests to control TTLs deterministically; must be safe for concurrent use. |
 
 ## Migrating from v1
 
