@@ -411,6 +411,65 @@ func TestRange(t *testing.T) {
 	}
 }
 
+// Range does not visit negative entries and stops when f returns false.
+func TestRange_SkipsNegativesAndStopsEarly(t *testing.T) {
+	now := fixedTime
+	c := New[string, string](notFoundConfig(time.Minute))
+	withClock(c, &now)
+	c.Set("a", "1")
+	c.Set("b", "2")
+	fetch := func(context.Context, string) (string, error) { return "", errNotFound }
+	if _, err := c.Get(context.Background(), "missing", fetch); !errors.Is(err, errNotFound) {
+		t.Fatalf("want errNotFound, got %v", err)
+	}
+
+	got := map[string]string{}
+	c.Range(func(k, v string, _ time.Duration) bool {
+		got[k] = v
+		return true
+	})
+	if len(got) != 2 || got["a"] != "1" || got["b"] != "2" {
+		t.Fatalf("Range got %v, want only the two values", got)
+	}
+
+	calls := 0
+	c.Range(func(string, string, time.Duration) bool {
+		calls++
+		return false
+	})
+	if calls != 1 {
+		t.Fatalf("Range called f %d times after it returned false, want 1", calls)
+	}
+}
+
+// An expired negative entry is dead and is evicted before live values.
+func TestCapacity_EvictsExpiredNegativeFirst(t *testing.T) {
+	now := fixedTime
+	cfg := notFoundConfig(time.Second)
+	cfg.Capacity = 2
+	c := New[string, string](cfg)
+	withClock(c, &now)
+
+	fetch := func(context.Context, string) (string, error) { return "", errNotFound }
+	if _, err := c.Get(context.Background(), "neg", fetch); !errors.Is(err, errNotFound) {
+		t.Fatalf("want errNotFound, got %v", err)
+	}
+	now = now.Add(2 * time.Second) // the negative entry expires (dead)
+
+	c.Set("live", "1")
+	c.Set("live2", "2") // over capacity: the dead negative must go first
+
+	if _, ok := c.load("neg"); ok {
+		t.Error("expired negative entry should have been evicted")
+	}
+	if _, ok := c.load("live"); !ok {
+		t.Error("live entry was evicted while a dead negative existed")
+	}
+	if _, ok := c.load("live2"); !ok {
+		t.Error("just-inserted entry must survive eviction")
+	}
+}
+
 func TestConcurrency_Race(t *testing.T) {
 	c := New[string, string](Config{})
 	var wg sync.WaitGroup
